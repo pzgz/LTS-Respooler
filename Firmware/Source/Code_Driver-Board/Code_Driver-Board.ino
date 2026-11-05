@@ -19,10 +19,41 @@
 #include "esp_private/periph_ctrl.h"
 #include "driver/gpio.h"
 #include <freertos/semphr.h>
+#include "soc/ledc_struct.h"
+#include "soc/gpio_struct.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/rtc.h"
+#include "hal/wdt_hal.h"
+#include "hal/brownout_ll.h"
+#include "esp_rtc_time.h"
+#include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_rom_sys.h"
+#include "esp_rom_crc.h"
+#include "esp_attr.h"
 
 // ------------------------ Board Info ----------------------------
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
+#define FIRMWARE_BUILD "1.3.0-wd1"  // printed on the serial port only
 #define BOARD_NAME "LTS DB"
+
+// ------------------ Robustness / power settings ------------------
+// See the "Watchdog, auto-resume and diagnostics" section further down.
+#define CPU_FREQ_MHZ 160              // stock: 240. 160 MHz is plenty and draws less current
+#define BLE_TX_POWER_DBM 0            // stock: +6 dBm
+#define WIFI_TX_POWER WIFI_POWER_11dBm  // stock: 19.5 dBm
+#define WIFI_OFF_WHILE_WINDING 1      // Wi-Fi is only needed for OTA; switch the radio off while winding
+#define BROWNOUT_LEVEL 7              // 0..7 = 2.43/2.48/2.58/2.62/2.67/2.70/2.77/2.80 V (stock: 0)
+#define RWDT_TIMEOUT_MS 6000          // no healthy loop() pass for this long -> system reset
+#define RWDT_STAGE1_MS 4000           // still stuck this much later -> full RTC reset (like pressing EN)
+#define HEALTH_CHECK_INTERVAL_MS 1000
+#define HEARTBEAT_INTERVAL_MS 1000
+#define RUNSTATE_SAVE_INTERVAL_MS 250
+#define AUTO_RESUME_DELAY_MS 4000     // wait after an abnormal reset before the motor restarts
+#define AUTO_RESUME_MAX_QUICK 3       // more quick crashes than this in a row -> stay paused
+#define AUTO_RESUME_STABLE_MS 60000   // winding this long after a resume counts as stable again
+#define BOOTLOOP_WINDOW_MS 30000
+#define BOOTLOOP_LIMIT 4              // this many abnormal boots within the window -> one full RTC reset
 
 // --------------------- Hardware Pin Defines ---------------------
 #define TMC_UART_RX 21
@@ -178,26 +209,104 @@ int ledPulseDirection = 1;
 unsigned long lastLedPulseTime = 0;
 uint16_t greenDitherAcc = 0;
 
+// Used before their definitions. The Arduino IDE generates these automatically; PlatformIO's .ino
+// converter skips some of them (e.g. std::string arguments), so they are declared explicitly.
+int calculatePWM(int brightnessPercent);
+void handleCommand(const std::string& cmd);
+void setMotorCurrent(int percent);
+
 // ---------- LEDC duty helpers ------------
 // Since ESP-IDF v5.5.x (arduino-esp32 3.3.x), ledc_update_duty() on the ESP32 busy-waits for the
 // channel's duty_start bit with interrupts disabled. Rewriting the same duty on every loop() pass
 // can leave duty_start stuck at 1, which hangs the CPU until the interrupt watchdog resets it.
-// The fan and connection LED channels are therefore only written when their duty changes.
+// The ESP32 must not get a new duty while the previous update is still pending (the IDF source says its
+// "internal logic might mess up"), but waiting for it with interrupts off is what hung 1.3.0. All
+// runtime duty updates therefore go through ledcSetDutyNoWait(): if the channel is free, the duty is
+// latched at once the way ESP-IDF <= 5.5.1 did it; if the previous update is still pending, the new
+// duty is parked and ledcServicePending() applies it from loop() once the hardware is done (normally
+// within one PWM period, at most 20 ms for the servo). The fan and connection LED channels are also
+// only written when their duty changes.
+#define LEDC_PENDING_STUCK_MS 200  // an update still pending after this long means the LEDC is broken
+static portMUX_TYPE ledcNoWaitMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t ledcPendingMask = 0;
+static uint32_t ledcPendingDuty[8];
+static unsigned long ledcPendingSince[8];
+static volatile bool ledcStuckSeen = false;
+
+static inline bool ledcUpdateBusy(int ch) {
+  return LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf1.duty_start;
+}
+
+static void ledcLatchDuty(ledc_channel_t ch, uint32_t duty) {
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);  // writes duty + fade parameters, no busy-wait
+  portENTER_CRITICAL(&ledcNoWaitMux);
+  LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf0.sig_out_en = 1;
+  LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf1.duty_start = 1;
+  LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf0.low_speed_update = 1;
+  portEXIT_CRITICAL(&ledcNoWaitMux);
+}
+
+static void ledcSetDutyNoWait(ledc_channel_t ch, uint32_t duty) {
+  bool busy;
+  portENTER_CRITICAL(&ledcNoWaitMux);
+  busy = ledcUpdateBusy(ch);
+  if (busy) {
+    if (!(ledcPendingMask & (1UL << ch))) ledcPendingSince[ch] = millis();
+    ledcPendingDuty[ch] = duty;
+    ledcPendingMask |= (1UL << ch);
+  } else {
+    ledcPendingMask &= ~(1UL << ch);
+  }
+  portEXIT_CRITICAL(&ledcNoWaitMux);
+  if (!busy) ledcLatchDuty(ch, duty);
+}
+
+// Called from loop(): applies parked duty updates once the previous update has finished.
+static void ledcServicePending() {
+  if (ledcPendingMask == 0) return;
+  for (int ch = 0; ch < 8; ch++) {
+    if (!(ledcPendingMask & (1UL << ch))) continue;
+    bool stuck = false;
+    portENTER_CRITICAL(&ledcNoWaitMux);
+    bool busy = ledcUpdateBusy(ch);
+    if (busy && millis() - ledcPendingSince[ch] >= LEDC_PENDING_STUCK_MS) stuck = true;
+    uint32_t duty = ledcPendingDuty[ch];
+    if (!busy || stuck) ledcPendingMask &= ~(1UL << ch);
+    portEXIT_CRITICAL(&ledcNoWaitMux);
+    if (busy && !stuck) continue;
+    if (stuck) {
+      ledcStuckSeen = true;  // the health check reports it and lets the watchdog reset the board
+      portENTER_CRITICAL(&ledcNoWaitMux);
+      LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf1.duty_start = 0;
+      portEXIT_CRITICAL(&ledcNoWaitMux);
+    }
+    ledcLatchDuty((ledc_channel_t)ch, duty);
+  }
+}
+
+// ledc_channel_config() calls ledc_update_duty() internally. Clearing a possibly stuck duty_start bit
+// first keeps that internal busy-wait from hanging when the STEP channel is re-attached at runtime.
+static void ledcChannelConfigSafe(const ledc_channel_config_t* cfg) {
+  portENTER_CRITICAL(&ledcNoWaitMux);
+  LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[cfg->channel].conf1.duty_start = 0;
+  ledcPendingMask &= ~(1UL << cfg->channel);
+  portEXIT_CRITICAL(&ledcNoWaitMux);
+  ledc_channel_config(cfg);
+}
+
 uint32_t fanDutyCurrent = UINT32_MAX;
 uint32_t connLedDutyCurrent = UINT32_MAX;
 
 void setFanDuty(uint32_t duty) {
   if (duty == fanDutyCurrent) return;
   fanDutyCurrent = duty;
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, FAN_CHANNEL, duty);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, FAN_CHANNEL);
+  ledcSetDutyNoWait(FAN_CHANNEL, duty);
 }
 
 void setConnLedDuty(uint32_t duty) {
   if (duty == connLedDutyCurrent) return;
   connLedDutyCurrent = duty;
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+  ledcSetDutyNoWait(LEDC_CHANNEL_2, duty);
 }
 
 // ---------- OTA LED pulse task handle and function ------------
@@ -275,6 +384,8 @@ void wifiScanTask(void* parameter) {
   vTaskDelete(NULL);
 }
 
+static void handleDiagCommand(const String& line);
+
 void pollSerialCommands() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -285,6 +396,10 @@ void pollSerialCommands() {
       if (serialRxLine.length() > 0) {
         if (serialRxLine.length() > 512) {
           serialRxLine = "";
+        } else if (serialRxLine[0] == '!') {
+          String line = serialRxLine;
+          serialRxLine = "";
+          handleDiagCommand(line);
         } else {
           std::string cmd(serialRxLine.c_str());
           handleCommand(cmd);
@@ -303,6 +418,515 @@ void pollSerialCommands() {
 bool wifiConnectInProgress = false;
 unsigned long wifiConnectStartTime = 0;
 
+// ================ Watchdog, auto-resume and diagnostics ================
+// Some boards stop dead while winding (fan stops, LED frozen, BLE gone, garbage on the USB serial
+// port) until EN is pressed. That points at the chip's clocks or peripherals being upset by a supply
+// dip rather than a software hang, and the task/interrupt watchdogs run from the same APB clock.
+//
+// 1. RTC watchdog. It runs from the RTC slow clock, independent of APB/PLL. loop() feeds it only
+//    while the board is healthy: loop() is running, esp_timer agrees with the RTC clock, and the LEDC
+//    outputs (fan, servo, connection LED, STEP) are still configured, routed and ticking. Not fed for
+//    RWDT_TIMEOUT_MS -> system reset; still stuck RWDT_STAGE1_MS later -> full RTC reset.
+// 2. Auto-resume. While winding, the job (elapsed time, guide servo position) is kept in RTC memory,
+//    which survives that reset. After an abnormal reset (watchdog, panic, brown-out) the board shows
+//    "paused" for AUTO_RESUME_DELAY_MS and then continues. After power-on or EN the job is restored
+//    as paused only, so the motor never starts by itself when the power is switched on.
+// 3. The brown-out threshold is raised (BROWNOUT_LEVEL) so a real supply dip gives a clean reset,
+//    and then a resume, instead of an undefined state.
+// 4. Serial diagnostics at 115200 baud, all lines start with '#': the reset reason and what the
+//    board was doing before it, then a heartbeat every second.
+//    Commands: !help !diag !hb 0|1 !wdt !fault !panic !reset
+
+#define RUNSTATE_MAGIC (0x52535000UL ^ (uint32_t)sizeof(RunState))
+#define DIAG_MAGIC (0x44474E00UL ^ (uint32_t)sizeof(DiagState))
+
+struct RunState {
+  uint32_t magic;
+  uint32_t elapsedMs;
+  uint32_t totalEstMs;
+  float servoPos;
+  float stepAcc;
+  uint8_t active;  // 1 = a winding job is in progress (state 'R')
+  uint8_t dir;
+  uint8_t servoTowardsL;
+  uint8_t quickResumes;  // auto-resumes since the job last ran AUTO_RESUME_STABLE_MS
+  uint32_t crc;
+};
+
+struct DiagState {
+  uint32_t magic;
+  uint32_t bootCount;
+  uint32_t abnormalCount;
+  uint32_t resumeCount;
+  uint32_t lastBootRtcMs;
+  uint32_t lastUptimeS;
+  uint32_t lastLoopMaxMs;
+  uint32_t lastFreeHeap;
+  int32_t lastClkPermille;
+  char lastState;
+  uint8_t lastFault;
+  uint8_t rapidBoots;
+  uint8_t rtcResetDone;
+};
+
+RTC_NOINIT_ATTR RunState rtcRun;
+RTC_NOINIT_ATTR DiagState rtcDiag;
+RTC_NOINIT_ATTR volatile uint32_t rtcCrumb;  // last loop()/setup() section entered
+#define CRUMB(n) (rtcCrumb = (uint32_t)(n))
+
+enum { FAULT_NONE = 0, FAULT_CLOCK = 1, FAULT_LEDC = 2, FAULT_TEST = 99 };
+
+static wdt_hal_context_t rwdtCtx = RWDT_HAL_CONTEXT_DEFAULT();
+static bool rwdtRunning = false;
+static volatile uint8_t healthFault = FAULT_NONE;
+static bool heartbeatOn = true;
+static bool autoResumePending = false;
+static unsigned long autoResumeAt = 0;
+static bool resumeStartRequested = false;
+static char bootResumeMode = 0;  // 0 = nothing to restore, 'A' = auto-resume, 'P' = restore as paused
+static uint32_t loopMaxMs = 0;
+static float lastClkRatio = 1.0f;
+static bool wifiSuspended = false;
+static esp_reset_reason_t bootReason = ESP_RST_UNKNOWN;
+static int bootRawReason = 0;
+static char bootLine[200] = "";
+static char prevLine[200] = "";
+
+static uint32_t runStateCrc() {
+  return esp_rom_crc32_le(0, (const uint8_t*)&rtcRun, offsetof(RunState, crc));
+}
+static bool runStateValid() {
+  return rtcRun.magic == RUNSTATE_MAGIC && rtcRun.crc == runStateCrc();
+}
+static void runStateCommit() {
+  rtcRun.magic = RUNSTATE_MAGIC;
+  rtcRun.crc = runStateCrc();
+}
+
+static uint32_t rwdtTicks(uint32_t ms) {
+  return (uint32_t)((uint64_t)ms * rtc_clk_slow_freq_get_hz() / 1000ULL);
+}
+
+static void rwdtStart() {
+  wdt_hal_init(&rwdtCtx, WDT_RWDT, 0, false);
+  wdt_hal_write_protect_disable(&rwdtCtx);
+  wdt_hal_config_stage(&rwdtCtx, WDT_STAGE0, rwdtTicks(RWDT_TIMEOUT_MS), WDT_STAGE_ACTION_RESET_SYSTEM);
+  wdt_hal_config_stage(&rwdtCtx, WDT_STAGE1, rwdtTicks(RWDT_STAGE1_MS), WDT_STAGE_ACTION_RESET_RTC);
+  wdt_hal_set_flashboot_en(&rwdtCtx, false);
+  wdt_hal_enable(&rwdtCtx);
+  wdt_hal_write_protect_enable(&rwdtCtx);
+  rwdtRunning = true;
+}
+
+static void rwdtFeed() {
+  if (!rwdtRunning) return;
+  wdt_hal_write_protect_disable(&rwdtCtx);
+  wdt_hal_feed(&rwdtCtx);
+  wdt_hal_write_protect_enable(&rwdtCtx);
+}
+
+// Resets the digital system and the RTC domain: the closest software equivalent of pressing EN.
+static void rtcFullReset() {
+  Serial.flush();
+  wdt_hal_init(&rwdtCtx, WDT_RWDT, 0, false);
+  wdt_hal_write_protect_disable(&rwdtCtx);
+  wdt_hal_config_stage(&rwdtCtx, WDT_STAGE0, rwdtTicks(20), WDT_STAGE_ACTION_RESET_RTC);
+  wdt_hal_enable(&rwdtCtx);
+  wdt_hal_write_protect_enable(&rwdtCtx);
+  volatile uint32_t spin = 0;
+  while (true) { spin++; }
+}
+
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool isAbnormalReset(esp_reset_reason_t r) {
+  return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT
+         || r == ESP_RST_BROWNOUT || r == ESP_RST_UNKNOWN;
+}
+
+static const char* faultName(uint8_t f) {
+  switch (f) {
+    case FAULT_CLOCK: return "clock";
+    case FAULT_LEDC: return "LEDC";
+    case FAULT_TEST: return "test";
+    default: return "none";
+  }
+}
+
+// Runs first thing in setup(). Reports why we booted, breaks boot loops and decides what to do with
+// a winding job that was interrupted.
+static void bootAnalyze() {
+  bootReason = esp_reset_reason();
+  bootRawReason = (int)esp_rom_get_reset_reason(0);
+  bool diagValid = rtcDiag.magic == DIAG_MAGIC && rtcDiag.bootCount < 100000000UL;
+  DiagState prev;
+  memset(&prev, 0, sizeof(prev));
+  uint32_t prevCrumb = 0;
+  if (diagValid) {
+    prev = rtcDiag;
+    prevCrumb = rtcCrumb;
+  } else {
+    memset(&rtcDiag, 0, sizeof(rtcDiag));
+    rtcDiag.magic = DIAG_MAGIC;
+  }
+  rtcCrumb = 0;
+
+  bool abnormal = isAbnormalReset(bootReason);
+  uint32_t nowRtcMs = (uint32_t)(esp_rtc_get_time_us() / 1000ULL);
+  rtcDiag.bootCount++;
+  if (abnormal) rtcDiag.abnormalCount++;
+  if (abnormal && diagValid && nowRtcMs >= rtcDiag.lastBootRtcMs
+      && nowRtcMs - rtcDiag.lastBootRtcMs < BOOTLOOP_WINDOW_MS) {
+    rtcDiag.rapidBoots++;
+  } else {
+    rtcDiag.rapidBoots = abnormal ? 1 : 0;
+  }
+  rtcDiag.lastBootRtcMs = nowRtcMs;
+  bool brokeLoop = rtcDiag.rtcResetDone;
+  rtcDiag.rtcResetDone = 0;
+
+  snprintf(bootLine, sizeof(bootLine), "#BOOT fw=%s reset=%s raw=%d boots=%lu abnormal=%lu resumes=%lu",
+           FIRMWARE_BUILD, resetReasonName(bootReason), bootRawReason, (unsigned long)rtcDiag.bootCount,
+           (unsigned long)rtcDiag.abnormalCount, (unsigned long)rtcDiag.resumeCount);
+  if (diagValid && prev.bootCount > 0) {
+    snprintf(prevLine, sizeof(prevLine), "#PREV up=%lus state=%c crumb=%lu loopmax=%lums clk=%.3f fault=%s heap=%lu",
+             (unsigned long)prev.lastUptimeS, prev.lastState ? prev.lastState : '-', (unsigned long)prevCrumb,
+             (unsigned long)prev.lastLoopMaxMs, prev.lastClkPermille / 1000.0, faultName(prev.lastFault),
+             (unsigned long)prev.lastFreeHeap);
+  } else {
+    snprintf(prevLine, sizeof(prevLine), "#PREV none (RTC memory was empty, i.e. power-on)");
+  }
+  Serial.println();
+  Serial.println(bootLine);
+  Serial.println(prevLine);
+  if (brokeLoop) Serial.println("#BOOT the previous boot loop was broken with a full RTC reset");
+
+  if (rtcDiag.rapidBoots >= BOOTLOOP_LIMIT) {
+    rtcDiag.rapidBoots = 0;
+    rtcDiag.rtcResetDone = 1;
+    Serial.println("#BOOTLOOP abnormal resets keep coming: full RTC reset");
+    rtcFullReset();
+  }
+
+  bootResumeMode = 0;
+  if (runStateValid() && rtcRun.active) {
+    bool sane = rtcRun.elapsedMs < 24UL * 3600UL * 1000UL && rtcRun.servoPos >= 0.0f && rtcRun.servoPos <= 180.0f;
+    if (!sane) {
+      Serial.println("#JOB interrupted, but the saved state looks wrong: ignored");
+    } else {
+      bool powerUp = bootReason == ESP_RST_POWERON || bootReason == ESP_RST_EXT || bootReason == ESP_RST_DEEPSLEEP;
+      if (powerUp) bootResumeMode = 'P';
+      else if (rtcRun.quickResumes >= AUTO_RESUME_MAX_QUICK) bootResumeMode = 'P';
+      else bootResumeMode = 'A';
+      Serial.printf("#JOB interrupted at %lus, servo %.1f deg -> %s\n", (unsigned long)(rtcRun.elapsedMs / 1000UL),
+                    rtcRun.servoPos,
+                    bootResumeMode == 'A' ? "auto-resume" : powerUp ? "paused (power-on: press the button or use the app)"
+                                                                    : "paused (too many quick crashes)");
+    }
+  }
+  if (bootResumeMode == 0) {
+    rtcRun.active = 0;
+    runStateCommit();
+  }
+}
+
+// Called in setup() after loadSettings(): puts an interrupted job back as a paused job.
+static void applyBootResume() {
+  if (!bootResumeMode) return;
+  pausedElapsed = rtcRun.elapsedMs > 0 ? rtcRun.elapsedMs : 1;
+  totalEstimatedTime = rtcRun.totalEstMs;
+  spoolingStartTime = 0;
+  guideServoPos = rtcRun.servoPos;
+  guideServoTowardsL = rtcRun.servoTowardsL != 0;
+  float stepsPerSpoolRev = (200.0f * (float)MICROSTEPPING) * (52.0f / 18.0f);
+  motorStepAcc = (rtcRun.stepAcc >= 0.0f && rtcRun.stepAcc < stepsPerSpoolRev) ? rtcRun.stepAcc : 0.0f;
+  if (rtcRun.dir != (uint8_t)motorDirection) {
+    Serial.printf("#JOB note: saved direction %u, settings say %d (using settings)\n", rtcRun.dir, motorDirection);
+  }
+  if (bootResumeMode == 'A') {
+    rtcRun.quickResumes++;
+    rtcDiag.resumeCount++;
+    runStateCommit();
+    autoResumePending = true;
+    autoResumeAt = millis() + AUTO_RESUME_DELAY_MS;
+  } else {
+    rtcRun.active = 0;
+    runStateCommit();
+  }
+}
+
+// ---- health checks ----
+#define LEDC_TIMER_CONF_MASK 0x03FFFFFFUL   // duty_resolution, clock_divider, pause, rst, tick_sel
+#define LEDC_TIMER_FIXED_MASK 0x0180001FUL  // duty_resolution, pause, rst (STEP timer changes frequency)
+static uint32_t snapFanTimer, snapServoTimer, snapConnTimer, snapStepTimer;
+static uint32_t snapFanCh, snapServoCh, snapConnCh;
+static bool ledcSnapValid = false;
+
+static inline uint32_t ledcTimerConf(int t) {
+  return LEDC.timer_group[LEDC_LOW_SPEED_MODE].timer[t].conf.val;
+}
+static inline uint32_t ledcChConf0(int ch) {
+  return LEDC.channel_group[LEDC_LOW_SPEED_MODE].channel[ch].conf0.val & 0x7;  // timer_sel + sig_out_en
+}
+static inline uint32_t gpioOutSel(int pin) {
+  return GPIO.func_out_sel_cfg[pin].func_sel;
+}
+
+// Called at the end of setup(), once all LEDC timers and channels are configured.
+static void ledcSnapshot() {
+  snapFanTimer = ledcTimerConf(FAN_TIMER) & LEDC_TIMER_CONF_MASK;
+  snapServoTimer = ledcTimerConf(SERVO_LEDC_TIMER) & LEDC_TIMER_CONF_MASK;
+  snapConnTimer = ledcTimerConf(LEDC_TIMER_0) & LEDC_TIMER_CONF_MASK;
+  snapStepTimer = ledcTimerConf(STEP_LEDC_TIMER) & LEDC_TIMER_FIXED_MASK;
+  snapFanCh = ledcChConf0(FAN_CHANNEL);
+  snapServoCh = ledcChConf0(SERVO_LEDC_CHANNEL);
+  snapConnCh = ledcChConf0(LEDC_CHANNEL_2);
+  ledcSnapValid = true;
+}
+
+static bool ledcTimerTicking(int t) {
+  uint32_t a = LEDC.timer_group[LEDC_LOW_SPEED_MODE].timer[t].value.timer_cnt;
+  for (int i = 0; i < 3; i++) {
+    esp_rom_delay_us(30);
+    if (LEDC.timer_group[LEDC_LOW_SPEED_MODE].timer[t].value.timer_cnt != a) return true;
+  }
+  return false;
+}
+
+static bool ledcHealthy() {
+  if (!ledcSnapValid) return true;
+  if ((ledcTimerConf(FAN_TIMER) & LEDC_TIMER_CONF_MASK) != snapFanTimer) return false;
+  if ((ledcTimerConf(SERVO_LEDC_TIMER) & LEDC_TIMER_CONF_MASK) != snapServoTimer) return false;
+  if ((ledcTimerConf(LEDC_TIMER_0) & LEDC_TIMER_CONF_MASK) != snapConnTimer) return false;
+  if (ledcChConf0(FAN_CHANNEL) != snapFanCh) return false;
+  if (ledcChConf0(SERVO_LEDC_CHANNEL) != snapServoCh) return false;
+  if (ledcChConf0(LEDC_CHANNEL_2) != snapConnCh) return false;
+  if (gpioOutSel(FAN_PIN) != (uint32_t)(LEDC_LS_SIG_OUT0_IDX + FAN_CHANNEL)) return false;
+  if (gpioOutSel(SERVO_PIN) != (uint32_t)(LEDC_LS_SIG_OUT0_IDX + SERVO_LEDC_CHANNEL)) return false;
+  if (gpioOutSel(LED_CONN_PIN) != (uint32_t)(LEDC_LS_SIG_OUT0_IDX + LEDC_CHANNEL_2)) return false;
+  if (!ledcTimerTicking(SERVO_LEDC_TIMER) || !ledcTimerTicking(LEDC_TIMER_0)) return false;
+  if (isMotorRunning) {
+    if ((ledcTimerConf(STEP_LEDC_TIMER) & LEDC_TIMER_FIXED_MASK) != snapStepTimer) return false;
+    if (ledcChConf0(STEP_LEDC_CHANNEL) != (uint32_t)(STEP_LEDC_TIMER | 0x4)) return false;
+    if (gpioOutSel(STEP_PIN) != (uint32_t)(LEDC_LS_SIG_OUT0_IDX + STEP_LEDC_CHANNEL)) return false;
+    if (!ledcTimerTicking(STEP_LEDC_TIMER)) return false;
+  }
+  return true;
+}
+
+static uint8_t healthCheck() {
+  static int64_t prevSysUs = 0;
+  static uint64_t prevRtcUs = 0;
+  static uint8_t clkBad = 0, ledcBad = 0;
+  int64_t sysUs = esp_timer_get_time();
+  uint64_t rtcUs = esp_rtc_get_time_us();
+  if (prevSysUs != 0) {
+    int64_t ds = sysUs - prevSysUs;
+    int64_t dr = (int64_t)(rtcUs - prevRtcUs);
+    if (dr > 200000) {
+      lastClkRatio = (float)((double)ds / (double)dr);
+      if (lastClkRatio < 0.85f || lastClkRatio > 1.15f) {
+        if (clkBad < 255) clkBad++;
+      } else {
+        clkBad = 0;
+      }
+    }
+  }
+  prevSysUs = sysUs;
+  prevRtcUs = rtcUs;
+  if (ledcHealthy()) ledcBad = 0;
+  else if (ledcBad < 255) ledcBad++;
+  if (clkBad >= 2) return FAULT_CLOCK;
+  if (ledcBad >= 2 || ledcStuckSeen) return FAULT_LEDC;
+  return FAULT_NONE;
+}
+
+// ---- Wi-Fi radio power ----
+static void wifiRadioOn() {
+  if (wifiSSID.length() == 0 || wifiPassword.length() == 0) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  WiFi.setTxPower(WIFI_TX_POWER);
+}
+
+static void wifiPowerManage(unsigned long now) {
+#if WIFI_OFF_WHILE_WINDING
+  static unsigned long idleSince = 0;
+  bool winding = currentState == 'R' || autoResumePending;
+  bool busy = otaInProgress || wifiConnectInProgress || wifiScanTaskHandle != nullptr;
+  if (winding) {
+    idleSince = 0;
+    if (!busy && WiFi.getMode() != WIFI_OFF) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      wifiSuspended = true;
+      Serial.println("#WIFI off while winding");
+    }
+  } else if (wifiSuspended) {
+    if (idleSince == 0) idleSince = now;
+    if (now - idleSince >= 5000) {
+      wifiSuspended = false;
+      idleSince = 0;
+      wifiRadioOn();
+      Serial.println("#WIFI on");
+    }
+  }
+#endif
+}
+
+static void printDiag(bool withBoot) {
+  if (withBoot) {
+    Serial.println(bootLine);
+    Serial.println(prevLine);
+  }
+  Serial.printf("#CFG cpu=%luMHz ble=%ddBm wifi_off_winding=%d brownout_lvl=%d rwdt=%d+%dms resume_delay=%dms\n",
+                (unsigned long)getCpuFrequencyMhz(), BLE_TX_POWER_DBM, WIFI_OFF_WHILE_WINDING, BROWNOUT_LEVEL,
+                RWDT_TIMEOUT_MS, RWDT_STAGE1_MS, AUTO_RESUME_DELAY_MS);
+  Serial.printf("#NOW state=%c job=%s quick_resumes=%u fault=%s heartbeat=%d\n", currentState,
+                (runStateValid() && rtcRun.active) ? "saved" : "none", rtcRun.quickResumes, faultName(healthFault),
+                heartbeatOn ? 1 : 0);
+}
+
+static void handleDiagCommand(const String& line) {
+  if (line == "!help") {
+    Serial.println("#CMD !diag | !hb 0 / !hb 1 | !wdt = hang loop() | !fault = stop feeding watchdog | !panic | !reset");
+  } else if (line == "!diag") {
+    printDiag(true);
+  } else if (line.startsWith("!hb")) {
+    heartbeatOn = !line.endsWith("0");
+    Serial.printf("#CMD heartbeat %s\n", heartbeatOn ? "on" : "off");
+  } else if (line == "!wdt") {
+    Serial.println("#TEST loop() hangs now; the RTC watchdog should reset the board in about 6 s");
+    Serial.flush();
+    volatile uint32_t spin = 0;
+    while (true) { spin++; }
+  } else if (line == "!fault") {
+    healthFault = FAULT_TEST;
+    Serial.println("#TEST stopped feeding the watchdog");
+  } else if (line == "!panic") {
+    Serial.println("#TEST abort()");
+    Serial.flush();
+    abort();
+  } else if (line == "!reset") {
+    Serial.println("#TEST esp_restart()");
+    Serial.flush();
+    esp_restart();
+  } else {
+    Serial.println("#CMD unknown, try !help");
+  }
+}
+
+// First thing in every loop() pass (loop() has early returns further down).
+static void healthTick(unsigned long now) {
+  static unsigned long lastLoopAt = 0, lastHealthAt = 0, lastHbAt = 0, lastSaveAt = 0, rStateSince = 0;
+  static uint32_t loopsThisSecond = 0;
+  static char prevState = 0;
+  static bool wifiTxSet = false;
+  static unsigned long lastFeedAt = 0;
+  CRUMB(1);
+  ledcServicePending();
+  if (lastLoopAt != 0 && now - lastLoopAt > loopMaxMs) loopMaxMs = now - lastLoopAt;
+  lastLoopAt = now;
+  loopsThisSecond++;
+
+  if (currentState != prevState) {
+    if (prevState) Serial.printf("#STATE %c -> %c\n", prevState, currentState);
+    if (currentState == 'R') {
+      rStateSince = now;
+      if (!resumeStartRequested) rtcRun.quickResumes = 0;  // started by the user: a fresh count
+    }
+    resumeStartRequested = false;
+    if (currentState != 'P') autoResumePending = false;  // stopped or started by the user meanwhile
+    prevState = currentState;
+  }
+
+  if (autoResumePending && (long)(now - autoResumeAt) >= 0) {
+    autoResumePending = false;
+    if (currentState == 'P' && !isMotorRunning && !shouldStartMotorNow && !otaInProgress) {
+      resumeStartRequested = true;
+      shouldStartMotorNow = true;
+      delayStartUntil = now;
+      Serial.println("#RESUME starting the motor");
+    }
+  }
+
+  if (now - lastSaveAt >= RUNSTATE_SAVE_INTERVAL_MS) {
+    lastSaveAt = now;
+    if (currentState == 'R') {
+      rtcRun.active = 1;
+      rtcRun.elapsedMs = spoolingStartTime > 0 ? (uint32_t)(now - spoolingStartTime) : (uint32_t)pausedElapsed;
+      rtcRun.totalEstMs = (uint32_t)totalEstimatedTime;
+      rtcRun.servoPos = guideServoPos;
+      rtcRun.stepAcc = motorStepAcc;
+      rtcRun.servoTowardsL = guideServoTowardsL ? 1 : 0;
+      rtcRun.dir = (uint8_t)motorDirection;
+      if (isMotorRunning && now - rStateSince >= AUTO_RESUME_STABLE_MS) rtcRun.quickResumes = 0;
+      runStateCommit();
+    } else if (rtcRun.active && !autoResumePending) {
+      rtcRun.active = 0;
+      runStateCommit();
+    }
+  }
+
+  if (now - lastHealthAt >= HEALTH_CHECK_INTERVAL_MS) {
+    lastHealthAt = now;
+    uint8_t f = healthCheck();
+    if (f != FAULT_NONE && healthFault == FAULT_NONE) {
+      healthFault = f;
+      Serial.printf("#FAULT %s: no longer feeding the watchdog, reset follows\n", faultName(f));
+    }
+    rtcDiag.lastFault = healthFault;
+  }
+
+  if (now - lastHbAt >= HEARTBEAT_INTERVAL_MS) {
+    lastHbAt = now;
+    uint32_t heap = ESP.getFreeHeap();
+    rtcDiag.lastUptimeS = now / 1000UL;
+    rtcDiag.lastState = currentState;
+    rtcDiag.lastLoopMaxMs = loopMaxMs;
+    rtcDiag.lastFreeHeap = heap;
+    rtcDiag.lastClkPermille = (int32_t)lroundf(lastClkRatio * 1000.0f);
+    bool wifiUp = !wifiSuspended && WiFi.status() == WL_CONNECTED;
+    if (wifiUp && !wifiTxSet) {
+      WiFi.setTxPower(WIFI_TX_POWER);
+      wifiTxSet = true;
+    } else if (!wifiUp) {
+      wifiTxSet = false;
+    }
+    if (heartbeatOn) {
+      unsigned long el = spoolingStartTime > 0 ? now - spoolingStartTime : pausedElapsed;
+      Serial.printf("#HB up=%lu st=%c run=%d el=%lu iv=%lu/%lu sv=%.1f lps=%lu lmax=%lu clk=%.3f heap=%lu wifi=%s ble=%d f=%s\n",
+                    now / 1000UL, currentState, isMotorRunning ? 1 : 0, el / 1000UL, stepIntervalMicros,
+                    targetStepIntervalMicros, guideServoPos, (unsigned long)loopsThisSecond, (unsigned long)loopMaxMs,
+                    lastClkRatio, (unsigned long)heap, wifiSuspended ? "off" : (wifiUp ? "ok" : "--"),
+                    deviceConnected ? 1 : 0, faultName(healthFault));
+    }
+    loopsThisSecond = 0;
+    loopMaxMs = 0;
+  }
+
+  wifiPowerManage(now);
+
+  if (healthFault == FAULT_NONE && now - lastFeedAt >= 100) {
+    lastFeedAt = now;
+    rwdtFeed();
+  }
+}
+
 // ------------------ Helper and utility functions ---------------
 int calculatePWM(int brightnessPercent) {
   float gamma = 1.15f;
@@ -317,8 +941,7 @@ inline void setServoAngle(int angle) {
   angle = constrain(angle, 0, 180);
   int pulseUs = map(angle, 0, 180, 500, 2500);
   uint32_t duty = (uint32_t)((((uint64_t)pulseUs) * ((1UL << 14) - 1) + 10000UL) / 20000UL);
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, SERVO_LEDC_CHANNEL, duty);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_LEDC_CHANNEL);
+  ledcSetDutyNoWait(SERVO_LEDC_CHANNEL, duty);
 }
 inline void setConnLed(uint8_t duty) {
   duty = constrain(duty, 0, 255);
@@ -334,12 +957,10 @@ inline void stepperSetFreq(uint32_t freqHz) {
 }
 inline void stepperStart(uint32_t freqHz) {
   stepperSetFreq(freqHz);
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, STEP_LEDC_CHANNEL, STEP_DUTY_ON);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, STEP_LEDC_CHANNEL);
+  ledcSetDutyNoWait(STEP_LEDC_CHANNEL, STEP_DUTY_ON);
 }
 inline void stepperStop() {
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, STEP_LEDC_CHANNEL, 0);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, STEP_LEDC_CHANNEL);
+  ledcSetDutyNoWait(STEP_LEDC_CHANNEL, 0);
 }
 int getSpeedPercentFromInterval(unsigned long us) {
   double t = (double)us;
@@ -601,7 +1222,7 @@ void playStepperJingle() {
       .duty = 0,
       .hpoint = 0
     };
-    ledc_channel_config(&step_ledc_chan);
+    ledcChannelConfigSafe(&step_ledc_chan);
   }
   stepperStop();
 }
@@ -769,7 +1390,7 @@ void handleCommand(const std::string& cmd) {
             .duty = 0,
             .hpoint = 0
           };
-          ledc_channel_config(&step_ledc_chan);
+          ledcChannelConfigSafe(&step_ledc_chan);
         }
         currentState = 'I';
         sendStatus(true);
@@ -1115,6 +1736,14 @@ void setup() {
   // so a stuck channel would survive the reboot and hang the ledc_*_config() calls below.
   periph_module_reset(PERIPH_LEDC_MODULE);
 
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+  brownout_ll_set_threshold(BROWNOUT_LEVEL);
+  Serial.setTxBufferSize(2048);  // heartbeat lines must not block loop()
+  Serial.begin(115200);
+  bootAnalyze();  // reports the reset reason; may do a full RTC reset to break a boot loop
+  rwdtStart();
+  CRUMB(100);
+
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
   pinMode(FILAMENT_PIN, INPUT_PULLUP);
@@ -1211,8 +1840,8 @@ void setup() {
   led.begin();
   led.clear();
   led.show();
+  CRUMB(101);
 
-  Serial.begin(115200);
   TMCSerial.begin(115200, SERIAL_8N1, TMC_UART_RX, TMC_UART_TX);
 
   driver.begin();
@@ -1227,17 +1856,25 @@ void setup() {
   driver.TCOOLTHRS(0xFFFFF);
   uint16_t cool = driver.COOLCONF();
   driver.COOLCONF(cool | (1 << 13));
+  CRUMB(102);
 
   prefs.begin("respooler", true);
   wifiSSID = prefs.getString("ssid", "");
   wifiPassword = prefs.getString("pwd", "");
   prefs.end();
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-
-  if (wifiSSID.length() > 0 && wifiPassword.length() > 0) {
-    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  if (bootResumeMode == 'A' && WIFI_OFF_WHILE_WINDING) {
+    // about to resume winding: leave the radio off, wifiPowerManage() turns it on afterwards
+    WiFi.mode(WIFI_OFF);
+    wifiSuspended = true;
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    if (wifiSSID.length() > 0 && wifiPassword.length() > 0) {
+      WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+      WiFi.setTxPower(WIFI_TX_POWER);
+    }
   }
+  CRUMB(103);
   bleNotifyMutex = xSemaphoreCreateMutex();
   loadSettings();
   setMotorCurrent(motorStrength);
@@ -1245,10 +1882,11 @@ void setup() {
 
   guideServoPos = (float)(servoHomeIsR ? servoAngleR : servoAngleL);
   guideServoTowardsL = servoHomeIsR;
+  applyBootResume();  // an interrupted job puts the guide servo back where it was
   setServoAngle((int)lroundf(guideServoPos));
 
   NimBLEDevice::init(BOARD_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P6);
+  NimBLEDevice::setPower(BLE_TX_POWER_DBM);
   NimBLEDevice::setMTU(512);
   NimBLEServer* pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -1274,17 +1912,28 @@ void setup() {
 
   pAdvertising->setAdvertisementData(advData);
   pAdvertising->start();
+  CRUMB(104);
   setFanDuty(0);
   setConnLed(150);
-  currentState = 'I';
+  currentState = bootResumeMode ? 'P' : 'I';
+  ledcSnapshot();
+  printDiag(false);
+  if (autoResumePending) {
+    Serial.printf("#RESUME in %d s (hold the button 1 s or send STOP to cancel)\n", AUTO_RESUME_DELAY_MS / 1000);
+  }
+  CRUMB(105);
+  rwdtFeed();
 }
 
 // ------------------- Main loop -----------------------------------
 void loop() {
   unsigned long now = millis();
+  healthTick(now);
   pollSerialCommands();
+  CRUMB(2);
 
   // ------------------ Wi-Fi connect async check -----------------
+  CRUMB(3);
   if (wifiConnectInProgress) {
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnectInProgress = false;
@@ -1318,6 +1967,7 @@ void loop() {
   }
 
   // ------------------ Filament sensor -----------------
+  CRUMB(4);
   bool rawFilamentPresent = digitalRead(FILAMENT_PIN) == LOW;
   if (rawFilamentPresent) {
     filamentLostSince = 0;
@@ -1352,6 +2002,7 @@ void loop() {
   }
 
   // ------------------ Motor/LED state -----------------
+  CRUMB(5);
   if (!otaInProgress) {
     if (isMotorRunning) {
       if (now - lastLedPulseTime > 5) {
@@ -1415,6 +2066,7 @@ void loop() {
   }
 
   // ----------------- Torque Auto-Stop -----------------
+  CRUMB(6);
   static unsigned long lastTorqueCheck = 0;
   static unsigned long torqueBelowStartTime = 0;
   if (torqueLimit > 0 && isMotorRunning && stepIntervalMicros == targetStepIntervalMicros) {
@@ -1478,7 +2130,7 @@ void loop() {
                 .duty = 0,
                 .hpoint = 0
               };
-              ledc_channel_config(&step_ledc_chan);
+              ledcChannelConfigSafe(&step_ledc_chan);
             }
             stepperStop();
           }
@@ -1491,6 +2143,7 @@ void loop() {
     torqueBelowStartTime = 0;
   }
 
+  CRUMB(7);
   static unsigned long wgtFinishStart = 0;
   if (isMotorRunning && targetWeight >= 1 && targetWeight <= 3 && totalEstimatedTime > 0) {
     unsigned long elapsed = 0;
@@ -1532,6 +2185,7 @@ void loop() {
   }
 
   // ------------------ Respooler done -------------------
+  CRUMB(8);
   if (isMotorRunning && useFilamentSensor && !filamentDetected && filamentLostSince > 0 && now - filamentLostSince > FILAMENT_LOSS_CONFIRM_MS) {
     isMotorRunning = false;
     digitalWrite(STEP_PIN, LOW);
@@ -1557,6 +2211,7 @@ void loop() {
   }
 
   // ------- Direction change after stop -----------
+  CRUMB(9);
   if (pendingDirectionChange && !isMotorRunning) {
     motorDirection = newMotorDirection;
     prefs.begin("respooler", false);
@@ -1569,6 +2224,7 @@ void loop() {
   }
 
   // ------------ Motor start logic ----------------
+  CRUMB(10);
   if (shouldStartMotorNow && now >= delayStartUntil) {
     if (otaInProgress) {
       shouldStartMotorNow = false;
@@ -1616,6 +2272,7 @@ void loop() {
   }
 
   // ------------ Button handling with debounce ------------
+  CRUMB(11);
   bool reading = digitalRead(BUTTON_PIN);
   if (reading != lastStableButtonState && now - lastDebounceTime > BUTTON_DEBOUNCE_MS) {
     lastDebounceTime = now;
@@ -1690,6 +2347,7 @@ void loop() {
   }
 
   // ----------- Motor acceleration (speed ramp) --------------
+  CRUMB(12);
   if (isMotorRunning && now - lastAccelUpdate > ACCEL_UPDATE_INTERVAL) {
     lastAccelUpdate = now;
     if (stepIntervalMicros > targetStepIntervalMicros) {
@@ -1717,6 +2375,7 @@ void loop() {
   }
 
   // ------------- Connection LED animation ------------------
+  CRUMB(13);
   if (!otaInProgress) {
     static int connLedPulse = 0;
     static int connLedDir = 2;
@@ -1740,17 +2399,20 @@ void loop() {
   }
 
   // ---------------------- Jingle trigger ---------------------
+  CRUMB(14);
   if (triggerJingleNow != 0) {
     playStepperJingle();
     triggerJingleNow = 0;
   }
 
   // ----------- Restart BLE advertising if disconnected --------------
+  CRUMB(15);
   if (!deviceConnected && !NimBLEDevice::getAdvertising()->isAdvertising()) {
     NimBLEDevice::startAdvertising();
   }
 
   // ------------------ Guide servo movement -----------------
+  CRUMB(16);
   if (isMotorRunning) {
     if (!servoWasRunning) {
       servoWasRunning = true;
@@ -1798,6 +2460,7 @@ void loop() {
   lastStateForServo = currentState;
 
   // ------------------ Respooler done ------------------
+  CRUMB(17);
   if (currentState == 'D' && lastStateForDone != 'D') {
     servoHomeAfterDonePending = true;
   }
@@ -1814,6 +2477,7 @@ void loop() {
   }
 
   // ------------------ Servo goto -----------------
+  CRUMB(18);
   if (!isMotorRunning && servoGotoActive) {
     if (now - lastServoHomeStepTime >= 10) {
       lastServoHomeStepTime = now;
@@ -1841,6 +2505,7 @@ void loop() {
   }
 
   // ------------------ Servo homing -----------------
+  CRUMB(19);
   if (!isMotorRunning && servoHomingToHome) {
     if (now - lastServoHomeStepTime >= 10) {
       lastServoHomeStepTime = now;
@@ -1860,6 +2525,7 @@ void loop() {
   }
 
   // ---------------- Fan control logic ----------------
+  CRUMB(20);
   int fanPWM = (fanAlwaysOn || isMotorRunning || millis() < fanStopAfter) ? fanPWMFromSpeed(fanSpeed) : 0;
   setFanDuty(fanPWM);
   if (!isMotorRunning && fanPWM > 0 && fanStopAfter == 0) {
@@ -1871,6 +2537,7 @@ void loop() {
   }
 
   // ----------- Periodic Status-Update every 500 ms -----------
+  CRUMB(21);
   static unsigned long lastStatusTime = 0;
   if (millis() - lastStatusTime > 500) {
     sendStatus();
