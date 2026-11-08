@@ -35,7 +35,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd4"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd5"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -146,6 +146,11 @@ bool servoHomeIsR = true;   // true, false
 #define SERVO_MM_PER_DEG_NOMINAL (35.0f * 3.77f / 360.0f)
 float servoMmPerDeg = SERVO_MM_PER_DEG_NOMINAL;
 float spoolWidthMm = 0.0f;  // inner width of the current spool (SV_W), 0 = not set
+// Spool revolutions the guide stays at an end stop before turning back (SV_DW). Without it the turn
+// next to each flange gets only half the filament of every other position (the guide passes it once
+// per round trip instead of twice), so the edges fall behind and the middle builds up.
+#define GUIDE_DWELL_DEFAULT 1.0f
+float guideDwellRevs = GUIDE_DWELL_DEFAULT;
 
 // Spool presets: end stops + inner width per spool type, switchable in one step (SPOOL / SPOOL_SAVE).
 #define SPOOL_PRESET_MAX 6
@@ -992,19 +997,39 @@ inline float guideStepDeg() {
   return d < 0.05f ? 0.05f : d;
 }
 
-// Current guide segment: the position at the start and at the end of the spool revolution in progress.
+// Current guide segment: start and end position, and how many spool revolutions it lasts.
+// The guide always moves at one step (servoStepMm) per revolution. The last piece before an end stop is
+// usually shorter than a step and lasts only that fraction of a revolution (the old code stretched it to
+// a full revolution, which packed extra filament next to the flanges); then the guide stays at the end
+// stop for guideDwellRevs revolutions and turns back.
 float guideSegFrom = 0.0f;
 float guideSegTo = 0.0f;
+float guideSegRevs = 1.0f;
+bool guideDwellPending = false;
 
-// Next waypoint one step further towards the current end stop; at the end stop the direction flips.
-float guideNextWaypoint(float from) {
+void guideNextSegment() {
+  float from = guideSegTo;
+  guideSegFrom = from;
+  if (guideDwellPending) {
+    guideDwellPending = false;
+    if (guideDwellRevs >= 0.05f) {
+      guideSegRevs = guideDwellRevs;
+      return;  // guideSegTo stays at the end stop
+    }
+  }
   float target = guideServoTowardsL ? (float)servoAngleL : (float)servoAngleR;
   float stepDeg = guideStepDeg();
-  if (fabsf(from - target) <= stepDeg) {
+  float dist = fabsf(target - from);
+  if (dist <= stepDeg) {
+    guideSegTo = target;
+    guideSegRevs = dist / stepDeg;
+    if (guideSegRevs < 0.02f) guideSegRevs = 0.02f;
     guideServoTowardsL = !guideServoTowardsL;
-    return target;
+    guideDwellPending = true;
+  } else {
+    guideSegTo = from + ((from < target) ? stepDeg : -stepDeg);
+    guideSegRevs = 1.0f;
   }
-  return from + ((from < target) ? stepDeg : -stepDeg);
 }
 inline void setConnLed(uint8_t duty) {
   duty = constrain(duty, 0, 255);
@@ -1076,6 +1101,8 @@ void loadSettings() {
   if (!(servoMmPerDeg >= 0.1f && servoMmPerDeg <= 1.0f)) servoMmPerDeg = SERVO_MM_PER_DEG_NOMINAL;
   spoolWidthMm = prefs.getFloat("spoolW", 0.0f);
   if (!(spoolWidthMm >= 0.0f && spoolWidthMm <= 300.0f)) spoolWidthMm = 0.0f;
+  guideDwellRevs = prefs.getFloat("svDwell", GUIDE_DWELL_DEFAULT);
+  if (!(guideDwellRevs >= 0.0f && guideDwellRevs <= 3.0f)) guideDwellRevs = GUIDE_DWELL_DEFAULT;
   memset(spoolPresets, 0, sizeof(spoolPresets));
   if (prefs.getBytesLength("spools1") == sizeof(spoolPresets)) {
     prefs.getBytes("spools1", spoolPresets, sizeof(spoolPresets));
@@ -1203,6 +1230,7 @@ void sendStatus(bool forceSend = false) {
   doc["SV_HOME"] = servoHomeIsR ? "R" : "L";
   doc["SV_MMD"] = roundf(servoMmPerDeg * 10000.0f) / 10000.0f;
   doc["SV_W"] = roundf(spoolWidthMm * 10.0f) / 10.0f;
+  doc["SV_DW"] = roundf(guideDwellRevs * 10.0f) / 10.0f;
   doc["SPOOL"] = activeSpool;
   doc["VAR"] = (boardVariant == 2) ? "PRO" : (boardVariant == 1) ? "STD"
                                                                  : "UNK";
@@ -1877,6 +1905,16 @@ void handleCommand(const std::string& cmd) {
         servoMmPerDeg = m;
         prefs.begin("respooler", false);
         prefs.putFloat("svMmDeg", servoMmPerDeg);
+        prefs.end();
+        changed = true;
+      }
+    }
+    if (set.containsKey("SV_DW")) {
+      float d = set["SV_DW"].as<float>();
+      if (d >= 0.0f && d <= 3.0f && fabsf(d - guideDwellRevs) > 0.001f) {
+        guideDwellRevs = d;
+        prefs.begin("respooler", false);
+        prefs.putFloat("svDwell", guideDwellRevs);
         prefs.end();
         changed = true;
       }
@@ -2713,17 +2751,22 @@ void loop() {
 
   // ------------------ Guide servo movement -----------------
   CRUMB(16);
-  // The guide moves continuously: during each spool revolution it travels from one waypoint to the
-  // next (one step = servoStepMm). The stock firmware jumped a whole step at once at the same spool
-  // angle every revolution. Waypoints and reversal at the end stops are the same as before.
+  // The guide moves continuously at one step (servoStepMm) per spool revolution, stays guideDwellRevs
+  // revolutions at each end stop, then turns back. The stock firmware jumped a whole step at once at the
+  // same spool angle every revolution and turned back immediately.
   if (isMotorRunning) {
     if (!servoWasRunning) {
       servoWasRunning = true;
       lastMotorStepAccTime = now;
       servoHomingToHome = false;
       servoGotoActive = false;
-      guideSegFrom = guideServoPos;
-      guideSegTo = guideNextWaypoint(guideSegFrom);
+      // Start a fresh segment at the current guide position (no jump after a pause). Starting at the
+      // end stop the guide is about to leave counts as arriving there: dwell first.
+      motorStepAcc = 0.0f;
+      guideSegTo = guideServoPos;
+      float behind = guideServoTowardsL ? (float)servoAngleR : (float)servoAngleL;
+      guideDwellPending = fabsf(guideServoPos - behind) < 0.05f;
+      guideNextSegment();
     } else {
       unsigned long dtMs = now - lastMotorStepAccTime;
       if (dtMs > 0) {
@@ -2733,12 +2776,13 @@ void loop() {
         motorStepAcc += stepsPerSec * ((float)dtMs / 1000.0f);
         float stepsPerSpoolRev = (200.0f * (float)MICROSTEPPING) * (52.0f / 18.0f);
 
-        while (motorStepAcc >= stepsPerSpoolRev) {
-          motorStepAcc -= stepsPerSpoolRev;
-          guideSegFrom = guideSegTo;
-          guideSegTo = guideNextWaypoint(guideSegFrom);
+        float segSteps = guideSegRevs * stepsPerSpoolRev;
+        while (motorStepAcc >= segSteps) {
+          motorStepAcc -= segSteps;
+          guideNextSegment();
+          segSteps = guideSegRevs * stepsPerSpoolRev;
         }
-        float frac = motorStepAcc / stepsPerSpoolRev;
+        float frac = motorStepAcc / segSteps;
         if (frac < 0.0f) frac = 0.0f;
         if (frac > 1.0f) frac = 1.0f;
         guideServoPos = guideSegFrom + (guideSegTo - guideSegFrom) * frac;
