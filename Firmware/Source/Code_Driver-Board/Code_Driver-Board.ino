@@ -37,7 +37,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd7"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd8"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -48,7 +48,9 @@
 #define BLE_TX_POWER_DBM 6            // stock: +6 dBm
 #define WIFI_TX_LIMIT 0               // 1 = cap the Wi-Fi transmit power at WIFI_TX_POWER (stock: no cap)
 #define WIFI_TX_POWER WIFI_POWER_11dBm
-#define WIFI_OFF_WHILE_WINDING 0      // 1 = switch the radio off while winding (stock: 0)
+#define WIFI_OFF_WHILE_WINDING 1      // 1 = Wi-Fi off while winding, back on 5 s after stopping (stock: 0).
+                                      // The ESP32 shares one radio between Wi-Fi and BLE; with both on, the BLE
+                                      // link dropped during winding (5 s without a packet at -61 dBm).
 
 // Wireless firmware update pushed from a computer (ArduinoOTA / espota, PlatformIO env "ota").
 // The password comes from local_ota.ini (git-ignored) through a build flag; empty = no password.
@@ -867,9 +869,9 @@ static void wifiPowerManage(unsigned long now) {
   if (winding) {
     idleSince = 0;
     if (!busy && WiFi.getMode() != WIFI_OFF) {
+      wifiSuspended = true;  // first, so the disconnect event is not counted as a Wi-Fi drop
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-      wifiSuspended = true;
       dlogln("#WIFI off while winding");
     }
   } else if (wifiSuspended) {
@@ -1008,12 +1010,20 @@ static void healthTick(unsigned long now) {
     if (heartbeatOn) {
       unsigned long el = spoolingStartTime > 0 ? now - spoolingStartTime : pausedElapsed;
       static uint8_t hbKeep = 0;
-      hbKeep = (hbKeep + 1) % 10;
-      dlogfKeep(hbKeep == 1, "#HB up=%lu st=%c run=%d el=%lu iv=%lu/%lu sv=%.1f lps=%lu lmax=%lu clk=%.3f heap=%lu wifi=%s ble=%d f=%s\n",
+      hbKeep = (hbKeep + 1) % 30;  // every 30th heartbeat goes into the /log buffer
+      int8_t bleRssi = 0;
+      if (deviceConnected) {
+        NimBLEServer* srv = NimBLEDevice::getServer();
+        if (srv) {
+          std::vector<uint16_t> peers = srv->getPeerDevices();
+          if (!peers.empty()) ble_gap_conn_rssi(peers[0], &bleRssi);
+        }
+      }
+      dlogfKeep(hbKeep == 1, "#HB up=%lu st=%c run=%d el=%lu iv=%lu/%lu sv=%.1f lps=%lu lmax=%lu clk=%.3f heap=%lu wifi=%s ble=%d/%d f=%s\n",
                     now / 1000UL, currentState, isMotorRunning ? 1 : 0, el / 1000UL, stepIntervalMicros,
                     targetStepIntervalMicros, guideServoPos, (unsigned long)loopsThisSecond, (unsigned long)loopMaxMs,
                     lastClkRatio, (unsigned long)heap, wifiSuspended ? "off" : (wifiUp ? "ok" : "--"),
-                    deviceConnected ? 1 : 0, faultName(healthFault));
+                    deviceConnected ? 1 : 0, (int)bleRssi, faultName(healthFault));
     }
     loopsThisSecond = 0;
     loopMaxMs = 0;
@@ -2169,7 +2179,8 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     bleLastReason = reason;
     // NimBLE reports HCI reasons as 0x200 + code: 0x208 link timeout, 0x213 closed by the other side,
     // 0x216 closed locally, 0x23e connection failed to be established
-    dlogf("#BLE disconnect reason=0x%03x peers=%d\n", reason, pServer->getConnectedCount());
+    dlogf("#BLE disconnect reason=0x%03x peers=%d st=%c wifi=%s\n", reason, pServer->getConnectedCount(), currentState,
+          wifiSuspended ? "off" : (WiFi.status() == WL_CONNECTED ? "on" : "--"));
     if (pServer->getConnectedCount() < 2) {
       NimBLEDevice::startAdvertising();
     }
@@ -2323,9 +2334,10 @@ void setup() {
   prefs.end();
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      if (wifiSuspended) return;  // switched off on purpose while winding
       wifiDisconnects++;
       wifiLastReason = info.wifi_sta_disconnected.reason;
-      dlogf("#WIFI disconnected reason=%d\n", wifiLastReason);
+      dlogf("#WIFI disconnected reason=%d st=%c\n", wifiLastReason, currentState);
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       dlogf("#WIFI connected ip=%s rssi=%d ch=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
     }
