@@ -34,7 +34,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd1"  // printed on the serial port only
+#define FIRMWARE_BUILD "1.3.0-wd2"  // printed on the serial port only
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -126,8 +126,28 @@ unsigned long fanStopAfter = 0;
 
 int servoAngleR = 5;        // deg
 int servoAngleL = 175;      // deg
-float servoStepMm = 1.75f;  // mm
+float servoStepMm = 1.75f;  // mm the guide advances per spool revolution (normally the filament diameter)
 bool servoHomeIsR = true;   // true, false
+
+// Guide travel per servo degree. The stock firmware assumes a 35-tooth module-1.2 pinion driven 1:1 by
+// a servo that turns exactly 180 deg over 500-2500 us. Real servos differ by several percent, so this is
+// a per-machine calibration (SV_MMD): measured guide travel between the two end stops / (SV_L - SV_R).
+#define SERVO_MM_PER_DEG_NOMINAL (35.0f * 3.77f / 360.0f)
+float servoMmPerDeg = SERVO_MM_PER_DEG_NOMINAL;
+float spoolWidthMm = 0.0f;  // inner width of the current spool (SV_W), 0 = not set
+
+// Spool presets: end stops + inner width per spool type, switchable in one step (SPOOL / SPOOL_SAVE).
+#define SPOOL_PRESET_MAX 6
+struct SpoolPreset {
+  char name[16];
+  uint8_t used;
+  uint8_t angleL;
+  uint8_t angleR;
+  uint8_t reserved;
+  float widthMm;
+};
+SpoolPreset spoolPresets[SPOOL_PRESET_MAX];
+int8_t activeSpool = -1;  // -1 = none selected
 
 // ----------------- Board variant identifier -----------------
 uint8_t boardVariant = 0;
@@ -937,11 +957,41 @@ int fanPWMFromSpeed(int percent) {
   return map(constrain(percent, 0, 100), 0, 100, 0, 255);
 }
 
-inline void setServoAngle(int angle) {
-  angle = constrain(angle, 0, 180);
-  int pulseUs = map(angle, 0, 180, 500, 2500);
-  uint32_t duty = (uint32_t)((((uint64_t)pulseUs) * ((1UL << 14) - 1) + 10000UL) / 20000UL);
+// Servo position with sub-degree resolution: 500-2500 us over 0-180 deg, 14-bit duty at 50 Hz
+// (1.22 us per count, about 0.11 deg). The stock firmware rounded to whole degrees, so the guide
+// advanced 4 or 5 deg per spool revolution in turn instead of a steady 4.8 deg.
+static uint32_t servoDutyLast = UINT32_MAX;
+inline void setServoAngleF(float angle) {
+  if (angle < 0.0f) angle = 0.0f;
+  if (angle > 180.0f) angle = 180.0f;
+  float pulseUs = 500.0f + angle * (2000.0f / 180.0f);
+  uint32_t duty = (uint32_t)lroundf(pulseUs * (float)((1UL << 14) - 1) / 20000.0f);
+  if (duty == servoDutyLast) return;
+  servoDutyLast = duty;
   ledcSetDutyNoWait(SERVO_LEDC_CHANNEL, duty);
+}
+inline void setServoAngle(int angle) {
+  setServoAngleF((float)angle);
+}
+// Servo degrees the guide advances per spool revolution.
+inline float guideStepDeg() {
+  float d = servoStepMm / servoMmPerDeg;
+  return d < 0.05f ? 0.05f : d;
+}
+
+// Current guide segment: the position at the start and at the end of the spool revolution in progress.
+float guideSegFrom = 0.0f;
+float guideSegTo = 0.0f;
+
+// Next waypoint one step further towards the current end stop; at the end stop the direction flips.
+float guideNextWaypoint(float from) {
+  float target = guideServoTowardsL ? (float)servoAngleL : (float)servoAngleR;
+  float stepDeg = guideStepDeg();
+  if (fabsf(from - target) <= stepDeg) {
+    guideServoTowardsL = !guideServoTowardsL;
+    return target;
+  }
+  return from + ((from < target) ? stepDeg : -stepDeg);
 }
 inline void setConnLed(uint8_t duty) {
   duty = constrain(duty, 0, 255);
@@ -1008,6 +1058,25 @@ void loadSettings() {
   servoAngleR = constrain(servoAngleR, 0, 180);
   servoAngleL = constrain(servoAngleL, 0, 180);
   servoStepMm = constrain(servoStepMm, 0.05f, 20.0f);
+
+  servoMmPerDeg = prefs.getFloat("svMmDeg", SERVO_MM_PER_DEG_NOMINAL);
+  if (!(servoMmPerDeg >= 0.1f && servoMmPerDeg <= 1.0f)) servoMmPerDeg = SERVO_MM_PER_DEG_NOMINAL;
+  spoolWidthMm = prefs.getFloat("spoolW", 0.0f);
+  if (!(spoolWidthMm >= 0.0f && spoolWidthMm <= 300.0f)) spoolWidthMm = 0.0f;
+  memset(spoolPresets, 0, sizeof(spoolPresets));
+  if (prefs.getBytesLength("spools1") == sizeof(spoolPresets)) {
+    prefs.getBytes("spools1", spoolPresets, sizeof(spoolPresets));
+  }
+  for (int i = 0; i < SPOOL_PRESET_MAX; i++) {
+    spoolPresets[i].name[sizeof(spoolPresets[i].name) - 1] = 0;
+    if (spoolPresets[i].used != 1 || spoolPresets[i].angleL > 180 || spoolPresets[i].angleR > 180) {
+      memset(&spoolPresets[i], 0, sizeof(SpoolPreset));
+    }
+  }
+  activeSpool = (int8_t)prefs.getChar("spoolSel", -1);
+  if (activeSpool < -1 || activeSpool >= SPOOL_PRESET_MAX || (activeSpool >= 0 && !spoolPresets[activeSpool].used)) {
+    activeSpool = -1;
+  }
 
   applySpeedTarget();
   prefs.end();
@@ -1118,6 +1187,9 @@ void sendStatus(bool forceSend = false) {
   doc["SV_L"] = servoAngleL;
   doc["SV_STP"] = servoStepMm;
   doc["SV_HOME"] = servoHomeIsR ? "R" : "L";
+  doc["SV_MMD"] = roundf(servoMmPerDeg * 10000.0f) / 10000.0f;
+  doc["SV_W"] = roundf(spoolWidthMm * 10.0f) / 10.0f;
+  doc["SPOOL"] = activeSpool;
   doc["VAR"] = (boardVariant == 2) ? "PRO" : (boardVariant == 1) ? "STD"
                                                                  : "UNK";
 
@@ -1344,6 +1416,48 @@ void sendOTAUpdate() {
               "OTAUpdateTask", 8192, NULL, 1, NULL);
 }
 
+// ------------------- Spool presets ------------------------
+static void spoolPresetsSave() {
+  prefs.begin("respooler", false);
+  prefs.putBytes("spools1", spoolPresets, sizeof(spoolPresets));
+  prefs.putChar("spoolSel", activeSpool);
+  prefs.end();
+}
+
+// Keeps the selected preset in step with calibration changes made while it is selected.
+static void spoolPresetSyncActive() {
+  if (activeSpool < 0 || activeSpool >= SPOOL_PRESET_MAX || !spoolPresets[activeSpool].used) return;
+  SpoolPreset& p = spoolPresets[activeSpool];
+  if (p.angleL == servoAngleL && p.angleR == servoAngleR && fabsf(p.widthMm - spoolWidthMm) < 0.05f) return;
+  p.angleL = (uint8_t)servoAngleL;
+  p.angleR = (uint8_t)servoAngleR;
+  p.widthMm = spoolWidthMm;
+  spoolPresetsSave();
+}
+
+// {"SPOOLS":[{"I":0,"N":"Bambu","L":165,"R":25,"W":58.0},...],"SPOOL":0}, sent on request only
+void sendSpools() {
+  if (!deviceConnected || !pCharacteristic) return;
+  StaticJsonDocument<768> doc;
+  JsonArray arr = doc["SPOOLS"].to<JsonArray>();
+  for (int i = 0; i < SPOOL_PRESET_MAX; i++) {
+    if (!spoolPresets[i].used) continue;
+    JsonObject o = arr.add<JsonObject>();
+    o["I"] = i;
+    o["N"] = spoolPresets[i].name;
+    o["L"] = spoolPresets[i].angleL;
+    o["R"] = spoolPresets[i].angleR;
+    o["W"] = roundf(spoolPresets[i].widthMm * 10.0f) / 10.0f;
+  }
+  doc["SPOOL"] = activeSpool;
+  String out;
+  serializeJson(doc, out);
+  if (bleNotifyMutex) xSemaphoreTake(bleNotifyMutex, portMAX_DELAY);
+  pCharacteristic->setValue(out.c_str());
+  pCharacteristic->notify();
+  if (bleNotifyMutex) xSemaphoreGive(bleNotifyMutex);
+}
+
 void handleCommand(const std::string& cmd) {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, cmd.c_str());
@@ -1425,6 +1539,8 @@ void handleCommand(const std::string& cmd) {
         currentState = 'P';
         sendStatus(true);
       }
+    } else if (command == "GET_SPOOLS") {
+      sendSpools();
     } else if (command == "WIFI_SCAN") {
       if (wifiScanTaskHandle == nullptr) {
         xTaskCreate(wifiScanTask, "WiFiScan", 4096, NULL, 1, &wifiScanTaskHandle);
@@ -1447,6 +1563,7 @@ void handleCommand(const std::string& cmd) {
     JsonObject set = doc["SET"].as<JsonObject>();
     bool changed = false;
     bool servoEndpointsChanged = false;
+    bool spoolsChanged = false;
     if (set.containsKey("VAR")) {
       JsonVariant vj = set["VAR"];
       uint8_t newVar = boardVariant;
@@ -1650,6 +1767,83 @@ void handleCommand(const std::string& cmd) {
         changed = true;
       }
     }
+    if (set.containsKey("SV_MMD")) {
+      float m = set["SV_MMD"].as<float>();
+      if (m >= 0.1f && m <= 1.0f && fabsf(m - servoMmPerDeg) > 0.00001f) {
+        servoMmPerDeg = m;
+        prefs.begin("respooler", false);
+        prefs.putFloat("svMmDeg", servoMmPerDeg);
+        prefs.end();
+        changed = true;
+      }
+    }
+    if (set.containsKey("SV_W")) {
+      float w = set["SV_W"].as<float>();
+      if (w >= 0.0f && w <= 300.0f && fabsf(w - spoolWidthMm) > 0.01f) {
+        spoolWidthMm = w;
+        prefs.begin("respooler", false);
+        prefs.putFloat("spoolW", spoolWidthMm);
+        prefs.end();
+        changed = true;
+      }
+    }
+    if (set.containsKey("SPOOL")) {
+      int i = set["SPOOL"].as<int>();
+      if (i == -1) {
+        activeSpool = -1;
+        spoolPresetsSave();
+        changed = true;
+      } else if (i >= 0 && i < SPOOL_PRESET_MAX && spoolPresets[i].used) {
+        activeSpool = (int8_t)i;
+        servoAngleL = spoolPresets[i].angleL;
+        servoAngleR = spoolPresets[i].angleR;
+        spoolWidthMm = spoolPresets[i].widthMm;
+        prefs.begin("respooler", false);
+        prefs.putUInt("servoL", (unsigned int)servoAngleL);
+        prefs.putUInt("servoR", (unsigned int)servoAngleR);
+        prefs.putFloat("spoolW", spoolWidthMm);
+        prefs.putChar("spoolSel", activeSpool);
+        prefs.end();
+        servoEndpointsChanged = true;
+        changed = true;
+      }
+    }
+    if (set.containsKey("SPOOL_SAVE")) {
+      JsonObject o = set["SPOOL_SAVE"].as<JsonObject>();
+      int i = o["I"] | -1;
+      if (i < 0) {  // first free slot
+        for (int k = 0; k < SPOOL_PRESET_MAX; k++) {
+          if (!spoolPresets[k].used) { i = k; break; }
+        }
+      }
+      if (i >= 0 && i < SPOOL_PRESET_MAX) {
+        SpoolPreset& p = spoolPresets[i];
+        const char* n = o["N"] | "";
+        memset(&p, 0, sizeof(p));
+        strncpy(p.name, (n && n[0]) ? n : "Spool", sizeof(p.name) - 1);
+        p.used = 1;
+        p.angleL = (uint8_t)servoAngleL;
+        p.angleR = (uint8_t)servoAngleR;
+        p.widthMm = spoolWidthMm;
+        activeSpool = (int8_t)i;
+        spoolPresetsSave();
+        spoolsChanged = true;
+        changed = true;
+      }
+    }
+    if (set.containsKey("SPOOL_DEL")) {
+      int i = set["SPOOL_DEL"].as<int>();
+      if (i >= 0 && i < SPOOL_PRESET_MAX && spoolPresets[i].used) {
+        memset(&spoolPresets[i], 0, sizeof(SpoolPreset));
+        if (activeSpool == i) activeSpool = -1;
+        spoolPresetsSave();
+        spoolsChanged = true;
+        changed = true;
+      }
+    }
+    if (set.containsKey("SV_L") || set.containsKey("SV_R") || set.containsKey("SV_W")) {
+      spoolPresetSyncActive();
+    }
     if (set.containsKey("SV_HOME")) {
       const char* v = set["SV_HOME"].as<const char*>();
       char c = (v && v[0]) ? v[0] : 0;
@@ -1698,6 +1892,7 @@ void handleCommand(const std::string& cmd) {
       prefs.putUChar("variant", boardVariant);
       prefs.end();
       sendStatus(true);
+      if (spoolsChanged) sendSpools();
     }
   }
 }
@@ -1883,7 +2078,7 @@ void setup() {
   guideServoPos = (float)(servoHomeIsR ? servoAngleR : servoAngleL);
   guideServoTowardsL = servoHomeIsR;
   applyBootResume();  // an interrupted job puts the guide servo back where it was
-  setServoAngle((int)lroundf(guideServoPos));
+  setServoAngleF(guideServoPos);
 
   NimBLEDevice::init(BOARD_NAME);
   NimBLEDevice::setPower(BLE_TX_POWER_DBM);
@@ -2413,12 +2608,17 @@ void loop() {
 
   // ------------------ Guide servo movement -----------------
   CRUMB(16);
+  // The guide moves continuously: during each spool revolution it travels from one waypoint to the
+  // next (one step = servoStepMm). The stock firmware jumped a whole step at once at the same spool
+  // angle every revolution. Waypoints and reversal at the end stops are the same as before.
   if (isMotorRunning) {
     if (!servoWasRunning) {
       servoWasRunning = true;
       lastMotorStepAccTime = now;
       servoHomingToHome = false;
       servoGotoActive = false;
+      guideSegFrom = guideServoPos;
+      guideSegTo = guideNextWaypoint(guideSegFrom);
     } else {
       unsigned long dtMs = now - lastMotorStepAccTime;
       if (dtMs > 0) {
@@ -2430,20 +2630,14 @@ void loop() {
 
         while (motorStepAcc >= stepsPerSpoolRev) {
           motorStepAcc -= stepsPerSpoolRev;
-
-          float target = guideServoTowardsL ? (float)servoAngleL : (float)servoAngleR;
-          float stepDeg = servoStepMm * (360.0f / (35.0f * 3.77f));
-          if (stepDeg < 0.05f) stepDeg = 0.05f;
-
-          if (fabsf(guideServoPos - target) <= stepDeg) {
-            guideServoPos = target;
-            setServoAngle((int)lroundf(guideServoPos));
-            guideServoTowardsL = !guideServoTowardsL;
-          } else {
-            guideServoPos += (guideServoPos < target) ? stepDeg : -stepDeg;
-            setServoAngle((int)lroundf(guideServoPos));
-          }
+          guideSegFrom = guideSegTo;
+          guideSegTo = guideNextWaypoint(guideSegFrom);
         }
+        float frac = motorStepAcc / stepsPerSpoolRev;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        guideServoPos = guideSegFrom + (guideSegTo - guideSegFrom) * frac;
+        setServoAngleF(guideServoPos);
       }
     }
   } else {
@@ -2495,11 +2689,11 @@ void loop() {
 
       if (fabsf(guideServoPos - target) <= stepDeg) {
         guideServoPos = target;
-        setServoAngle((int)lroundf(guideServoPos));
+        setServoAngleF(guideServoPos);
         servoGotoActive = false;
       } else {
         guideServoPos += (guideServoPos < target) ? stepDeg : -stepDeg;
-        setServoAngle((int)lroundf(guideServoPos));
+        setServoAngleF(guideServoPos);
       }
     }
   }
@@ -2515,11 +2709,11 @@ void loop() {
 
       if (fabsf(guideServoPos - targetHome) <= stepDeg) {
         guideServoPos = targetHome;
-        setServoAngle((int)lroundf(guideServoPos));
+        setServoAngleF(guideServoPos);
         servoHomingToHome = false;
       } else {
         guideServoPos += (guideServoPos < targetHome) ? stepDeg : -stepDeg;
-        setServoAngle((int)lroundf(guideServoPos));
+        setServoAngleF(guideServoPos);
       }
     }
   }
