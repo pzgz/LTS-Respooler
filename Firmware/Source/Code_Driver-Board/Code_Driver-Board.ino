@@ -828,7 +828,8 @@ static void printDiag(bool withBoot) {
                 (unsigned long)getCpuFrequencyMhz(), BLE_TX_POWER_DBM, WIFI_OFF_WHILE_WINDING, BROWNOUT_LEVEL,
                 RWDT_TIMEOUT_MS, RWDT_STAGE1_MS, AUTO_RESUME_DELAY_MS);
   Serial.printf("#NOW state=%c job=%s quick_resumes=%u fault=%s heartbeat=%d\n", currentState,
-                (runStateValid() && rtcRun.active) ? "saved" : "none", rtcRun.quickResumes, faultName(healthFault),
+                (runStateValid() && rtcRun.active) ? "saved" : "none", runStateValid() ? rtcRun.quickResumes : 0,
+                faultName(healthFault),
                 heartbeatOn ? 1 : 0);
 }
 
