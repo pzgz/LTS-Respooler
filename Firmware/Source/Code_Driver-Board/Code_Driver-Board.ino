@@ -9,6 +9,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
@@ -34,15 +35,25 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd3"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd4"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
 // See the "Watchdog, auto-resume and diagnostics" section further down.
-#define CPU_FREQ_MHZ 160              // stock: 240. 160 MHz is plenty and draws less current
-#define BLE_TX_POWER_DBM 0            // stock: +6 dBm
-#define WIFI_TX_POWER WIFI_POWER_11dBm  // stock: 19.5 dBm
-#define WIFI_OFF_WHILE_WINDING 1      // Wi-Fi is only needed for OTA; switch the radio off while winding
+// CPU and radio run at the stock values. The lower settings were a stop-gap while the 5 V rail was weak;
+// with D1 bridged, the extra capacitors and a separate servo supply they are no longer needed.
+#define CPU_FREQ_MHZ 240              // stock: 240 (160 draws a little less)
+#define BLE_TX_POWER_DBM 6            // stock: +6 dBm
+#define WIFI_TX_LIMIT 0               // 1 = cap the Wi-Fi transmit power at WIFI_TX_POWER (stock: no cap)
+#define WIFI_TX_POWER WIFI_POWER_11dBm
+#define WIFI_OFF_WHILE_WINDING 0      // 1 = switch the radio off while winding (stock: 0)
+
+// Wireless firmware update pushed from a computer (ArduinoOTA / espota, PlatformIO env "ota").
+// The password comes from local_ota.ini (git-ignored) through a build flag; empty = no password.
+#define OTA_HOSTNAME "lts-respooler"  // -> lts-respooler.local
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
 #define BROWNOUT_LEVEL 7              // 0..7 = 2.43/2.48/2.58/2.62/2.67/2.70/2.77/2.80 V (stock: 0)
 #define RWDT_TIMEOUT_MS 6000          // no healthy loop() pass for this long -> system reset
 #define RWDT_STAGE1_MS 4000           // still stuck this much later -> full RTC reset (like pressing EN)
@@ -780,7 +791,7 @@ static void wifiRadioOn() {
   if (wifiSSID.length() == 0 || wifiPassword.length() == 0) return;
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  WiFi.setTxPower(WIFI_TX_POWER);
+  if (WIFI_TX_LIMIT) WiFi.setTxPower(WIFI_TX_POWER);
 }
 
 static void wifiPowerManage(unsigned long now) {
@@ -922,7 +933,7 @@ static void healthTick(unsigned long now) {
     rtcDiag.lastClkPermille = (int32_t)lroundf(lastClkRatio * 1000.0f);
     bool wifiUp = !wifiSuspended && WiFi.status() == WL_CONNECTED;
     if (wifiUp && !wifiTxSet) {
-      WiFi.setTxPower(WIFI_TX_POWER);
+      if (WIFI_TX_LIMIT) WiFi.setTxPower(WIFI_TX_POWER);
       wifiTxSet = true;
     } else if (!wifiUp) {
       wifiTxSet = false;
@@ -1298,6 +1309,62 @@ void playStepperJingle() {
     ledcChannelConfigSafe(&step_ledc_chan);
   }
   stepperStop();
+}
+
+// ------------------ Wireless update pushed from a computer ------------------
+// `pio run -e ota -t upload` sends the new build over Wi-Fi (espota, UDP/TCP 3232). The board only
+// listens while it is not winding, so a push during a job fails cleanly with "No response from device".
+// The transfer runs inside ArduinoOTA.handle(), i.e. it blocks loop(); onProgress keeps the RTC
+// watchdog fed meanwhile.
+static bool arduinoOtaStarted = false;
+static volatile bool arduinoOtaActive = false;
+
+static void arduinoOtaService() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!arduinoOtaStarted) {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.setRebootOnSuccess(true);
+    ArduinoOTA.onStart([]() {
+      arduinoOtaActive = true;
+      isMotorRunning = false;
+      shouldStartMotorNow = false;
+      stepperStop();
+      digitalWrite(STEP_PIN, LOW);
+      digitalWrite(EN_PIN, HIGH);
+      otaInProgress = true;
+      currentState = 'U';
+      sendStatus(true);
+      if (otaLedPulseTaskHandle == nullptr) {
+        xTaskCreate(otaLedPulseTask, "OtaLedPulse", 1024, NULL, 2, &otaLedPulseTaskHandle);
+      }
+      Serial.println("#OTA push: receiving");
+      rwdtFeed();
+    });
+    ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+      rwdtFeed();
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("#OTA push: done, restarting");
+      rwdtFeed();
+    });
+    ArduinoOTA.onError([](ota_error_t err) {
+      Serial.printf("#OTA push: error %d\n", (int)err);
+      arduinoOtaActive = false;
+      otaInProgress = false;
+      otaLedPulseTaskHandle = nullptr;
+      currentState = 'I';
+      sendStatus(true);
+      rwdtFeed();
+    });
+    ArduinoOTA.begin();
+    arduinoOtaStarted = true;
+    Serial.printf("#OTA push ready: %s.local (%s) auth=%s\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str(),
+                  strlen(OTA_PASSWORD) > 0 ? "yes" : "no");
+  }
+  bool busy = isMotorRunning || shouldStartMotorNow || autoResumePending || currentState == 'R' ||
+              (otaInProgress && !arduinoOtaActive);
+  if (!busy) ArduinoOTA.handle();
 }
 
 // --------------------- BLE command handling -------------------------
@@ -2101,7 +2168,7 @@ void setup() {
     WiFi.disconnect(true);
     if (wifiSSID.length() > 0 && wifiPassword.length() > 0) {
       WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-      WiFi.setTxPower(WIFI_TX_POWER);
+      if (WIFI_TX_LIMIT) WiFi.setTxPower(WIFI_TX_POWER);
     }
   }
   CRUMB(103);
@@ -2160,6 +2227,7 @@ void loop() {
   unsigned long now = millis();
   healthTick(now);
   pollSerialCommands();
+  arduinoOtaService();
   CRUMB(2);
 
   // ------------------ Wi-Fi connect async check -----------------
