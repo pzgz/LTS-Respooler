@@ -34,7 +34,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd2"  // printed on the serial port only
+#define FIRMWARE_BUILD "1.3.0-wd3"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -1170,6 +1170,7 @@ void sendStatus(bool forceSend = false) {
   doc["WIFI_SSID"] = wifiSSID.length() > 0 ? wifiSSID.c_str() : nullptr;
   doc["WIFI_OK"] = WiFi.status() == WL_CONNECTED;
   doc["FW"] = FIRMWARE_VERSION;
+  doc["FW_B"] = FIRMWARE_BUILD;
   doc["OTA_OK"] = nullptr;
   doc["SPD"] = speedPercent;
   doc["JIN"] = jingleStyle;
@@ -1300,6 +1301,23 @@ void playStepperJingle() {
 }
 
 // --------------------- BLE command handling -------------------------
+// OTA source. The official server is the default. {"CMD":"OTA","URL":"http://..."} installs a build from
+// any other address instead (e.g. a computer on the LAN); the URL is used once and not stored.
+static const char* OTA_URL_OFFICIAL = "https://respooler.lts-design.com/Firmware/ESP32-WROOM-32_OTA.bin";
+static char otaUrlOverride[200] = "";
+
+static void notifyOtaResult(bool ok) {
+  if (!deviceConnected || !pCharacteristic) return;
+  StaticJsonDocument<64> doc;
+  doc["OTA_OK"] = ok;
+  String jsonOut;
+  serializeJson(doc, jsonOut);
+  if (bleNotifyMutex) xSemaphoreTake(bleNotifyMutex, portMAX_DELAY);
+  pCharacteristic->setValue(jsonOut.c_str());
+  pCharacteristic->notify();
+  if (bleNotifyMutex) xSemaphoreGive(bleNotifyMutex);
+}
+
 void sendOTAUpdate() {
   if (otaInProgress) {
     return;
@@ -1311,10 +1329,15 @@ void sendOTAUpdate() {
   currentState = 'U';
   sendStatus(true);
   xTaskCreate([](void*) {
-    const char* ota_url = "https://respooler.lts-design.com/Firmware/ESP32-WROOM-32_OTA.bin";
-    WiFiClientSecure client;
-    client.setInsecure();
+    String ota_url = otaUrlOverride[0] ? String(otaUrlOverride) : String(OTA_URL_OFFICIAL);
+    otaUrlOverride[0] = 0;
+    bool plainHttp = ota_url.startsWith("http://");
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    WiFiClient plainClient;
+    WiFiClient& client = plainHttp ? plainClient : (WiFiClient&)secureClient;
     HTTPClient http;
+    Serial.printf("#OTA from %s\n", ota_url.c_str());
 
     if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == INADDR_NONE) {
       currentState = 'I';
@@ -1332,6 +1355,7 @@ void sendOTAUpdate() {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     int httpCode = http.GET();
     bool otaSuccess = false;
+    Serial.printf("#OTA http=%d size=%d\n", httpCode, http.getSize());
 
     if (httpCode == HTTP_CODE_OK) {
       int contentLength = http.getSize();
@@ -1396,6 +1420,7 @@ void sendOTAUpdate() {
     }
     http.end();
     if (!otaSuccess) {
+      Serial.printf("#OTA failed: %s\n", Update.errorString());
       if (deviceConnected && pCharacteristic) {
         StaticJsonDocument<64> doc;
         doc["OTA_OK"] = false;
@@ -1547,6 +1572,16 @@ void handleCommand(const std::string& cmd) {
       }
     } else if (command == "OTA") {
       if (!otaInProgress) {
+        const char* u = doc["URL"] | "";
+        size_t n = strlen(u);
+        if (n == 0) {
+          otaUrlOverride[0] = 0;
+        } else if (n < sizeof(otaUrlOverride) && (strncmp(u, "http://", 7) == 0 || strncmp(u, "https://", 8) == 0)) {
+          memcpy(otaUrlOverride, u, n + 1);
+        } else {
+          notifyOtaResult(false);
+          return;
+        }
         sendOTAUpdate();
       }
     } else if (command == "WIFI_CONNECT") {
