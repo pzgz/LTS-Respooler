@@ -10,6 +10,8 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <stdarg.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
@@ -35,7 +37,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd5"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd6"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -65,6 +67,64 @@
 #define AUTO_RESUME_STABLE_MS 60000   // winding this long after a resume counts as stable again
 #define BOOTLOOP_WINDOW_MS 30000
 #define BOOTLOOP_LIMIT 4              // this many abnormal boots within the window -> one full RTC reset
+
+// ------------------------ Diagnostic log ------------------------
+// Every '#' line printed on the serial port also goes into a RAM ring buffer with an uptime stamp, so it
+// can be read over Wi-Fi without a USB cable: http://lts-respooler.local/log (#HB only every 10 s).
+#define DLOG_SIZE 8192
+static char dlogBuf[DLOG_SIZE];
+static size_t dlogHead = 0;
+static bool dlogWrapped = false;
+static portMUX_TYPE dlogMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void dlogAppend(const char* s, size_t n) {
+  portENTER_CRITICAL(&dlogMux);
+  for (size_t i = 0; i < n; i++) {
+    dlogBuf[dlogHead++] = s[i];
+    if (dlogHead >= DLOG_SIZE) {
+      dlogHead = 0;
+      dlogWrapped = true;
+    }
+  }
+  portEXIT_CRITICAL(&dlogMux);
+}
+
+static void dlogv(bool keep, const char* fmt, va_list ap) {
+  char line[256];
+  int n = vsnprintf(line, sizeof(line), fmt, ap);
+  if (n <= 0) return;
+  if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
+  Serial.write((const uint8_t*)line, n);
+  if (!keep) return;
+  char ts[16];
+  unsigned long ms = millis();
+  int tn = snprintf(ts, sizeof(ts), "%5lu.%01lu ", ms / 1000UL, (ms / 100UL) % 10UL);
+  dlogAppend(ts, tn);
+  dlogAppend(line, n);
+}
+
+static void dlogf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  dlogv(true, fmt, ap);
+  va_end(ap);
+}
+
+static void dlogfKeep(bool keep, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  dlogv(keep, fmt, ap);
+  va_end(ap);
+}
+
+static void dlogln(const char* s) {
+  dlogf("%s\n", s);
+}
+
+// Link statistics, shown at the top of /log
+static volatile uint32_t bleDisconnects = 0, wifiDisconnects = 0;
+static volatile int bleLastReason = 0, wifiLastReason = 0;
+static volatile uint16_t bleConnItvl = 0, bleConnLatency = 0, bleConnTimeout = 0;
 
 // --------------------- Hardware Pin Defines ---------------------
 #define TMC_UART_RX 21
@@ -647,14 +707,14 @@ static void bootAnalyze() {
     snprintf(prevLine, sizeof(prevLine), "#PREV none (RTC memory was empty, i.e. power-on)");
   }
   Serial.println();
-  Serial.println(bootLine);
-  Serial.println(prevLine);
-  if (brokeLoop) Serial.println("#BOOT the previous boot loop was broken with a full RTC reset");
+  dlogln(bootLine);
+  dlogln(prevLine);
+  if (brokeLoop) dlogln("#BOOT the previous boot loop was broken with a full RTC reset");
 
   if (rtcDiag.rapidBoots >= BOOTLOOP_LIMIT) {
     rtcDiag.rapidBoots = 0;
     rtcDiag.rtcResetDone = 1;
-    Serial.println("#BOOTLOOP abnormal resets keep coming: full RTC reset");
+    dlogln("#BOOTLOOP abnormal resets keep coming: full RTC reset");
     rtcFullReset();
   }
 
@@ -662,13 +722,13 @@ static void bootAnalyze() {
   if (runStateValid() && rtcRun.active) {
     bool sane = rtcRun.elapsedMs < 24UL * 3600UL * 1000UL && rtcRun.servoPos >= 0.0f && rtcRun.servoPos <= 180.0f;
     if (!sane) {
-      Serial.println("#JOB interrupted, but the saved state looks wrong: ignored");
+      dlogln("#JOB interrupted, but the saved state looks wrong: ignored");
     } else {
       bool powerUp = bootReason == ESP_RST_POWERON || bootReason == ESP_RST_EXT || bootReason == ESP_RST_DEEPSLEEP;
       if (powerUp) bootResumeMode = 'P';
       else if (rtcRun.quickResumes >= AUTO_RESUME_MAX_QUICK) bootResumeMode = 'P';
       else bootResumeMode = 'A';
-      Serial.printf("#JOB interrupted at %lus, servo %.1f deg -> %s\n", (unsigned long)(rtcRun.elapsedMs / 1000UL),
+      dlogf("#JOB interrupted at %lus, servo %.1f deg -> %s\n", (unsigned long)(rtcRun.elapsedMs / 1000UL),
                     rtcRun.servoPos,
                     bootResumeMode == 'A' ? "auto-resume" : powerUp ? "paused (power-on: press the button or use the app)"
                                                                     : "paused (too many quick crashes)");
@@ -691,7 +751,7 @@ static void applyBootResume() {
   float stepsPerSpoolRev = (200.0f * (float)MICROSTEPPING) * (52.0f / 18.0f);
   motorStepAcc = (rtcRun.stepAcc >= 0.0f && rtcRun.stepAcc < stepsPerSpoolRev) ? rtcRun.stepAcc : 0.0f;
   if (rtcRun.dir != (uint8_t)motorDirection) {
-    Serial.printf("#JOB note: saved direction %u, settings say %d (using settings)\n", rtcRun.dir, motorDirection);
+    dlogf("#JOB note: saved direction %u, settings say %d (using settings)\n", rtcRun.dir, motorDirection);
   }
   if (bootResumeMode == 'A') {
     rtcRun.quickResumes++;
@@ -810,7 +870,7 @@ static void wifiPowerManage(unsigned long now) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       wifiSuspended = true;
-      Serial.println("#WIFI off while winding");
+      dlogln("#WIFI off while winding");
     }
   } else if (wifiSuspended) {
     if (idleSince == 0) idleSince = now;
@@ -818,7 +878,7 @@ static void wifiPowerManage(unsigned long now) {
       wifiSuspended = false;
       idleSince = 0;
       wifiRadioOn();
-      Serial.println("#WIFI on");
+      dlogln("#WIFI on");
     }
   }
 #endif
@@ -829,10 +889,10 @@ static void printDiag(bool withBoot) {
     Serial.println(bootLine);
     Serial.println(prevLine);
   }
-  Serial.printf("#CFG cpu=%luMHz ble=%ddBm wifi_off_winding=%d brownout_lvl=%d rwdt=%d+%dms resume_delay=%dms\n",
+  dlogf("#CFG cpu=%luMHz ble=%ddBm wifi_off_winding=%d brownout_lvl=%d rwdt=%d+%dms resume_delay=%dms\n",
                 (unsigned long)getCpuFrequencyMhz(), BLE_TX_POWER_DBM, WIFI_OFF_WHILE_WINDING, BROWNOUT_LEVEL,
                 RWDT_TIMEOUT_MS, RWDT_STAGE1_MS, AUTO_RESUME_DELAY_MS);
-  Serial.printf("#NOW state=%c job=%s quick_resumes=%u fault=%s heartbeat=%d\n", currentState,
+  dlogf("#NOW state=%c job=%s quick_resumes=%u fault=%s heartbeat=%d\n", currentState,
                 (runStateValid() && rtcRun.active) ? "saved" : "none",
                 (runStateValid() && rtcRun.active) ? rtcRun.quickResumes : 0,
                 faultName(healthFault),
@@ -841,30 +901,30 @@ static void printDiag(bool withBoot) {
 
 static void handleDiagCommand(const String& line) {
   if (line == "!help") {
-    Serial.println("#CMD !diag | !hb 0 / !hb 1 | !wdt = hang loop() | !fault = stop feeding watchdog | !panic | !reset");
+    dlogln("#CMD !diag | !hb 0 / !hb 1 | !wdt = hang loop() | !fault = stop feeding watchdog | !panic | !reset");
   } else if (line == "!diag") {
     printDiag(true);
   } else if (line.startsWith("!hb")) {
     heartbeatOn = !line.endsWith("0");
-    Serial.printf("#CMD heartbeat %s\n", heartbeatOn ? "on" : "off");
+    dlogf("#CMD heartbeat %s\n", heartbeatOn ? "on" : "off");
   } else if (line == "!wdt") {
-    Serial.println("#TEST loop() hangs now; the RTC watchdog should reset the board in about 6 s");
+    dlogln("#TEST loop() hangs now; the RTC watchdog should reset the board in about 6 s");
     Serial.flush();
     volatile uint32_t spin = 0;
     while (true) { spin++; }
   } else if (line == "!fault") {
     healthFault = FAULT_TEST;
-    Serial.println("#TEST stopped feeding the watchdog");
+    dlogln("#TEST stopped feeding the watchdog");
   } else if (line == "!panic") {
-    Serial.println("#TEST abort()");
+    dlogln("#TEST abort()");
     Serial.flush();
     abort();
   } else if (line == "!reset") {
-    Serial.println("#TEST esp_restart()");
+    dlogln("#TEST esp_restart()");
     Serial.flush();
     esp_restart();
   } else {
-    Serial.println("#CMD unknown, try !help");
+    dlogln("#CMD unknown, try !help");
   }
 }
 
@@ -882,7 +942,7 @@ static void healthTick(unsigned long now) {
   loopsThisSecond++;
 
   if (currentState != prevState) {
-    if (prevState) Serial.printf("#STATE %c -> %c\n", prevState, currentState);
+    if (prevState) dlogf("#STATE %c -> %c\n", prevState, currentState);
     if (currentState == 'R') {
       rStateSince = now;
       if (!resumeStartRequested) rtcRun.quickResumes = 0;  // started by the user: a fresh count
@@ -898,7 +958,7 @@ static void healthTick(unsigned long now) {
       resumeStartRequested = true;
       shouldStartMotorNow = true;
       delayStartUntil = now;
-      Serial.println("#RESUME starting the motor");
+      dlogln("#RESUME starting the motor");
     }
   }
 
@@ -925,7 +985,7 @@ static void healthTick(unsigned long now) {
     uint8_t f = healthCheck();
     if (f != FAULT_NONE && healthFault == FAULT_NONE) {
       healthFault = f;
-      Serial.printf("#FAULT %s: no longer feeding the watchdog, reset follows\n", faultName(f));
+      dlogf("#FAULT %s: no longer feeding the watchdog, reset follows\n", faultName(f));
     }
     rtcDiag.lastFault = healthFault;
   }
@@ -947,7 +1007,9 @@ static void healthTick(unsigned long now) {
     }
     if (heartbeatOn) {
       unsigned long el = spoolingStartTime > 0 ? now - spoolingStartTime : pausedElapsed;
-      Serial.printf("#HB up=%lu st=%c run=%d el=%lu iv=%lu/%lu sv=%.1f lps=%lu lmax=%lu clk=%.3f heap=%lu wifi=%s ble=%d f=%s\n",
+      static uint8_t hbKeep = 0;
+      hbKeep = (hbKeep + 1) % 10;
+      dlogfKeep(hbKeep == 1, "#HB up=%lu st=%c run=%d el=%lu iv=%lu/%lu sv=%.1f lps=%lu lmax=%lu clk=%.3f heap=%lu wifi=%s ble=%d f=%s\n",
                     now / 1000UL, currentState, isMotorRunning ? 1 : 0, el / 1000UL, stepIntervalMicros,
                     targetStepIntervalMicros, guideServoPos, (unsigned long)loopsThisSecond, (unsigned long)loopMaxMs,
                     lastClkRatio, (unsigned long)heap, wifiSuspended ? "off" : (wifiUp ? "ok" : "--"),
@@ -1349,9 +1411,43 @@ void playStepperJingle() {
 static bool arduinoOtaStarted = false;
 static volatile bool arduinoOtaActive = false;
 
+static WebServer diagServer(80);
+
+static void diagHandleLog() {
+  String out;
+  out.reserve(DLOG_SIZE + 700);
+  char hdr[640];
+  snprintf(hdr, sizeof(hdr),
+           "fw=%s up=%lus state=%c heap=%lu min_heap=%lu\n"
+           "wifi rssi=%d dBm ch=%d disconnects=%lu last_reason=%d\n"
+           "ble peers=%d disconnects=%lu last_reason=0x%03x itvl=%.1fms latency=%u timeout=%ums\n"
+           "---- log (uptime s), oldest first ----\n",
+           FIRMWARE_BUILD, millis() / 1000UL, currentState, (unsigned long)ESP.getFreeHeap(),
+           (unsigned long)ESP.getMinFreeHeap(), WiFi.RSSI(), WiFi.channel(), (unsigned long)wifiDisconnects,
+           wifiLastReason, NimBLEDevice::getServer() ? NimBLEDevice::getServer()->getConnectedCount() : 0,
+           (unsigned long)bleDisconnects, bleLastReason, bleConnItvl * 1.25f, (unsigned)bleConnLatency,
+           (unsigned)bleConnTimeout * 10U);
+  out += hdr;
+  portENTER_CRITICAL(&dlogMux);
+  size_t head = dlogHead;
+  bool wrapped = dlogWrapped;
+  portEXIT_CRITICAL(&dlogMux);
+  if (wrapped) {
+    size_t i = head;
+    while (i < DLOG_SIZE && dlogBuf[i] != '\n') i++;  // skip the partly overwritten first line
+    for (i = i + 1; i < DLOG_SIZE; i++) out += dlogBuf[i];
+  }
+  for (size_t i = 0; i < head; i++) out += dlogBuf[i];
+  diagServer.send(200, "text/plain; charset=utf-8", out);
+}
+
 static void arduinoOtaService() {
   if (WiFi.status() != WL_CONNECTED) return;
+  if (arduinoOtaStarted) diagServer.handleClient();
   if (!arduinoOtaStarted) {
+    diagServer.on("/", diagHandleLog);
+    diagServer.on("/log", diagHandleLog);
+    diagServer.begin();
     ArduinoOTA.setHostname(OTA_HOSTNAME);
     if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.setRebootOnSuccess(true);
@@ -1368,18 +1464,18 @@ static void arduinoOtaService() {
       if (otaLedPulseTaskHandle == nullptr) {
         xTaskCreate(otaLedPulseTask, "OtaLedPulse", 1024, NULL, 2, &otaLedPulseTaskHandle);
       }
-      Serial.println("#OTA push: receiving");
+      dlogln("#OTA push: receiving");
       rwdtFeed();
     });
     ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
       rwdtFeed();
     });
     ArduinoOTA.onEnd([]() {
-      Serial.println("#OTA push: done, restarting");
+      dlogln("#OTA push: done, restarting");
       rwdtFeed();
     });
     ArduinoOTA.onError([](ota_error_t err) {
-      Serial.printf("#OTA push: error %d\n", (int)err);
+      dlogf("#OTA push: error %d\n", (int)err);
       arduinoOtaActive = false;
       otaInProgress = false;
       otaLedPulseTaskHandle = nullptr;
@@ -1389,7 +1485,7 @@ static void arduinoOtaService() {
     });
     ArduinoOTA.begin();
     arduinoOtaStarted = true;
-    Serial.printf("#OTA push ready: %s.local (%s) auth=%s\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str(),
+    dlogf("#OTA push ready: %s.local (%s) auth=%s\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str(),
                   strlen(OTA_PASSWORD) > 0 ? "yes" : "no");
   }
   bool busy = isMotorRunning || shouldStartMotorNow || autoResumePending || currentState == 'R' ||
@@ -1434,7 +1530,7 @@ void sendOTAUpdate() {
     WiFiClient plainClient;
     WiFiClient& client = plainHttp ? plainClient : (WiFiClient&)secureClient;
     HTTPClient http;
-    Serial.printf("#OTA from %s\n", ota_url.c_str());
+    dlogf("#OTA from %s\n", ota_url.c_str());
 
     if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == INADDR_NONE) {
       currentState = 'I';
@@ -1452,7 +1548,7 @@ void sendOTAUpdate() {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     int httpCode = http.GET();
     bool otaSuccess = false;
-    Serial.printf("#OTA http=%d size=%d\n", httpCode, http.getSize());
+    dlogf("#OTA http=%d size=%d\n", httpCode, http.getSize());
 
     if (httpCode == HTTP_CODE_OK) {
       int contentLength = http.getSize();
@@ -1517,7 +1613,7 @@ void sendOTAUpdate() {
     }
     http.end();
     if (!otaSuccess) {
-      Serial.printf("#OTA failed: %s\n", Update.errorString());
+      dlogf("#OTA failed: %s\n", Update.errorString());
       if (deviceConnected && pCharacteristic) {
         StaticJsonDocument<64> doc;
         doc["OTA_OK"] = false;
@@ -2041,8 +2137,17 @@ void handleCommand(const std::string& cmd) {
 
 // ------------------- BLE callback classes ------------------------
 class MyServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo&) override {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& info) override {
     deviceConnected = true;
+    // Ask the central for a 5 s supervision timeout (interval 30-50 ms, no latency; inside Apple's
+    // limits). Typical defaults are 0.7-2 s, and the ESP32 shares one radio between Wi-Fi and BLE, so a
+    // short gap in BLE connection events otherwise drops the link although the signal is strong.
+    pServer->updateConnParams(info.getConnHandle(), 24, 40, 0, 500);
+    bleConnItvl = info.getConnInterval();
+    bleConnLatency = info.getConnLatency();
+    bleConnTimeout = info.getConnTimeout();
+    dlogf("#BLE connect peers=%d itvl=%.1fms timeout=%ums\n", pServer->getConnectedCount(),
+          bleConnItvl * 1.25f, (unsigned)bleConnTimeout * 10U);
     if (pServer->getConnectedCount() < 2) {
       NimBLEDevice::startAdvertising();
     }
@@ -2053,11 +2158,23 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     },
                 "delayedSend", 2048, NULL, 1, NULL);
   }
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo&, int) override {
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo&, int reason) override {
     deviceConnected = pServer->getConnectedCount() > 0;
+    bleDisconnects++;
+    bleLastReason = reason;
+    // NimBLE reports HCI reasons as 0x200 + code: 0x208 link timeout, 0x213 closed by the other side,
+    // 0x216 closed locally, 0x23e connection failed to be established
+    dlogf("#BLE disconnect reason=0x%03x peers=%d\n", reason, pServer->getConnectedCount());
     if (pServer->getConnectedCount() < 2) {
       NimBLEDevice::startAdvertising();
     }
+  }
+  void onConnParamsUpdate(NimBLEConnInfo& info) override {
+    bleConnItvl = info.getConnInterval();
+    bleConnLatency = info.getConnLatency();
+    bleConnTimeout = info.getConnTimeout();
+    dlogf("#BLE params itvl=%.1fms latency=%u timeout=%ums\n", bleConnItvl * 1.25f, (unsigned)bleConnLatency,
+          (unsigned)bleConnTimeout * 10U);
   }
 };
 class MyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
@@ -2199,6 +2316,15 @@ void setup() {
   wifiSSID = prefs.getString("ssid", "");
   wifiPassword = prefs.getString("pwd", "");
   prefs.end();
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      wifiDisconnects++;
+      wifiLastReason = info.wifi_sta_disconnected.reason;
+      dlogf("#WIFI disconnected reason=%d\n", wifiLastReason);
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      dlogf("#WIFI connected ip=%s rssi=%d ch=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    }
+  });
   if (bootResumeMode == 'A' && WIFI_OFF_WHILE_WINDING) {
     // about to resume winding: leave the radio off, wifiPowerManage() turns it on afterwards
     WiFi.mode(WIFI_OFF);
@@ -2256,7 +2382,7 @@ void setup() {
   ledcSnapshot();
   printDiag(false);
   if (autoResumePending) {
-    Serial.printf("#RESUME in %d s (hold the button 1 s or send STOP to cancel)\n", AUTO_RESUME_DELAY_MS / 1000);
+    dlogf("#RESUME in %d s (hold the button 1 s or send STOP to cancel)\n", AUTO_RESUME_DELAY_MS / 1000);
   }
   CRUMB(105);
   rwdtFeed();
