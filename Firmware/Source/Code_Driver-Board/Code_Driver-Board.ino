@@ -37,7 +37,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd8"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd9"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -45,7 +45,7 @@
 // CPU and radio run at the stock values. The lower settings were a stop-gap while the 5 V rail was weak;
 // with D1 bridged, the extra capacitors and a separate servo supply they are no longer needed.
 #define CPU_FREQ_MHZ 240              // stock: 240 (160 draws a little less)
-#define BLE_TX_POWER_DBM 6            // stock: +6 dBm
+#define BLE_TX_POWER_DBM 9            // stock: +6 dBm. +9 is the ESP32 maximum; the link margin to the Mac was thin
 #define WIFI_TX_LIMIT 0               // 1 = cap the Wi-Fi transmit power at WIFI_TX_POWER (stock: no cap)
 #define WIFI_TX_POWER WIFI_POWER_11dBm
 #define WIFI_OFF_WHILE_WINDING 1      // 1 = Wi-Fi off while winding, back on 5 s after stopping (stock: 0).
