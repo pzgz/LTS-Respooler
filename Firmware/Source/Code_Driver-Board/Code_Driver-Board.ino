@@ -37,7 +37,7 @@
 
 // ------------------------ Board Info ----------------------------
 #define FIRMWARE_VERSION "1.3.0"  // reported to the app; kept so the app treats this build like 1.3.0
-#define FIRMWARE_BUILD "1.3.0-wd6"  // printed on the serial port and reported as FW_B
+#define FIRMWARE_BUILD "1.3.0-wd7"  // printed on the serial port and reported as FW_B
 #define BOARD_NAME "LTS DB"
 
 // ------------------ Robustness / power settings ------------------
@@ -1443,8 +1443,13 @@ static void diagHandleLog() {
 
 static void arduinoOtaService() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (arduinoOtaStarted) diagServer.handleClient();
+  static unsigned long lastHttpPoll = 0;
+  if (arduinoOtaStarted && millis() - lastHttpPoll >= 25) {  // the page is rarely asked for; don't poll every pass
+    lastHttpPoll = millis();
+    diagServer.handleClient();
+  }
   if (!arduinoOtaStarted) {
+    diagServer.enableDelay(false);  // WebServer otherwise sleeps 1 ms per idle poll, i.e. in every loop() pass
     diagServer.on("/", diagHandleLog);
     diagServer.on("/log", diagHandleLog);
     diagServer.begin();
